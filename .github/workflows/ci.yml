@@ -1,0 +1,25 @@
+name: macOS checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require change documentation
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: zsh scripts/check-docs.sh "$BASE_SHA"
+      - name: Privacy and tests
+        run: zsh scripts/check.sh
+      - name: Build app
+        run: zsh scripts/build-app.sh
