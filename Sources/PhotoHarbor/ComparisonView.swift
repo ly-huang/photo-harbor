@@ -55,7 +55,7 @@ struct ComparisonView: View {
                     if analyzing { ProgressView().controlSize(.small) }
                     Spacer(minLength: 12)
                     Button { fitToken += 1 } label: { Label("全部适应", systemImage: "arrow.down.right.and.arrow.up.left") }.help("同时适应全部图片；单张请右键操作")
-                    Button { info.togglePin() } label: { Label(info.pinned ? "取消固定评测" : "固定评测", systemImage: info.pinned ? "pin.fill" : "sidebar.right") }.help("靠近窗口右侧查看；固定后不遮挡照片")
+                    Button { info.togglePin() } label: { Label(info.pinned ? "取消固定评测" : "固定评测", systemImage: "sidebar.right") }.help("靠近窗口右侧查看；固定后不遮挡照片")
                     NavigatorToggle(visible: $store.navigatorVisible)
                     Button { chrome.togglePin() } label: { Label(chrome.pinned ? "自动隐藏工具" : "固定工具", systemImage: chrome.pinned ? "pin.fill" : "pin") }.labelStyle(.iconOnly).help(chrome.pinned ? "工具栏已固定，点击恢复自动隐藏（H）" : "工具栏自动隐藏，点击固定（H）")
                     Button { store.comparisonController?.window?.toggleFullScreen(nil) } label: { Label(store.comparisonFullScreen ? "退出全屏" : "全屏", systemImage: store.comparisonFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") }.labelStyle(.iconOnly).help(store.comparisonFullScreen ? "退出全屏" : "全屏")
@@ -88,14 +88,15 @@ struct ComparisonView: View {
         InteractivePhoto(url: photo.preview, fitToken: fitToken, fullScreen: store.comparisonFullScreen, navigatorVisible: store.navigatorVisible,
             evaluate: { activeIndex = index; store.assessPhoto(photo); info.reveal() },
             showInfo: { activeIndex = index; info.reveal() }, activated: { if activeIndex != index { activeIndex = index } },
-            toggleNavigator: { store.navigatorVisible.toggle() }, rejected: store.state.rejected.contains(photo.id), navigatorTopInset: 44,
+            toggleNavigator: { store.navigatorVisible.toggle() }, labels:store.labels(for:photo),labelChanged:{if let label=$0{store.toggleLabel(label,photo:photo)}else{store.clearLabels(photo)}}, rejected: store.state.rejected.contains(photo.id), navigatorTopInset: 44,
             previous: {}, next: {}, mark: { store.toggleReject(photo) })
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .id(photo.id).frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay(alignment: .bottomLeading) {
                 HStack(spacing: 7) {
                     Image(systemName: activeIndex == index ? "circle.inset.filled" : "circle").font(.system(size: 8)).foregroundStyle(.secondary)
                     Text("\(index + 1)").font(.caption.bold())
                     Text(photo.name).font(.caption).lineLimit(1)
+                    if !store.labels(for:photo).isEmpty{PhotoLabelDots(labels:store.labels(for:photo))}
                     if store.state.rejected.contains(photo.id) { Image(systemName: "trash.fill").foregroundStyle(.red) }
                 }.padding(.horizontal, 9).padding(.vertical, 6).modifier(PhotoGlass(radius: 20)).padding(10).allowsHitTesting(false)
             }

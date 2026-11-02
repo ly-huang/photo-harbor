@@ -129,6 +129,10 @@ struct LibraryView: View {
                 HStack { Image(systemName: "magnifyingglass"); TextField("搜索文件名或相册", text: $store.search).textFieldStyle(.plain) }
                     .font(.system(size: 12)).padding(8).frame(maxWidth: 280).background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
                 Spacer()
+                Menu {
+                    ForEach(PhotoLabel.allCases,id:\.self){label in Button {store.labelFilter=label;store.reconcileSelection()} label:{Label{Text(label.rawValue)} icon:{Image(nsImage:label.menuImage).renderingMode(.original)}.labelStyle(.titleAndIcon)}}
+                } label:{Label(store.labelFilter.map{"\($0.rawValue)标记"} ?? "颜色标记",systemImage:"tag")}
+                if store.labelFilter != nil{Button{store.labelFilter=nil;store.reconcileSelection()}label:{Image(systemName:"xmark.circle.fill")}.buttonStyle(.borderless).help("清除标记筛选")}
                 Image(systemName: "square.grid.3x3").foregroundStyle(.secondary)
                 Slider(value: $thumbnailSize, in: 150...320).frame(width: 90).help("缩略图大小")
             }
@@ -233,6 +237,7 @@ struct PhotoCard: View {
             }.clipShape(RoundedRectangle(cornerRadius: 6))
             HStack {
                 Text(photo.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                if !store.labels(for:photo).isEmpty {PhotoLabelDots(labels:store.labels(for:photo))}
                 Spacer(minLength: 3)
                 Text(photo.ambiguous ? "待检查" : photo.paired ? "JPG + ARW" : photo.files[0].isRAW ? "ARW" : "JPG")
                     .font(.system(size: 9, weight: .medium)).foregroundStyle(photo.ambiguous ? .orange : .secondary)
@@ -249,6 +254,7 @@ struct PhotoCard: View {
             if store.comparisonSelection.contains(photo.id) { Button("对比所选图片") { store.showComparison() }.disabled(!(2...4).contains(store.comparisonPhotos.count)) }
             Button("评测此图片") { store.assessPhoto(photo) }.disabled(store.assessing.contains(photo.id))
             Divider()
+            PhotoLabelMenu(photo:photo)
             Button(store.state.rejected.contains(photo.id) ? "取消待删除" : "标记待删除") { store.toggleReject(photo) }.disabled(store.busy)
             Button("在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting(photo.files.map(\.url)) }
         }.accessibilityElement(children: .contain).accessibilityAddTraits(.isButton).accessibilityLabel(photo.name)
@@ -367,6 +373,7 @@ struct ViewerView: View {
     @StateObject private var chrome = ChromeState()
     @ViewState private var fitToken = 0
     @StateObject private var info = InspectorState()
+    @ViewState private var editingPhoto: Photo?
     var body: some View {
         HStack(spacing: 0) {
             ZStack {
@@ -375,10 +382,10 @@ struct ViewerView: View {
                     InteractivePhoto(url: photo.preview, fitToken: fitToken, fullScreen: store.viewerFullScreen,
                         navigatorVisible: store.navigatorVisible,
                         evaluate: { evaluate(photo) }, showInfo: { info.reveal(); chrome.reveal() },
-                        toggleNavigator: { store.navigatorVisible.toggle() }, rejected: store.state.rejected.contains(photo.id), navigatorTopInset: 60,
+                        toggleNavigator: { store.navigatorVisible.toggle() }, labels:store.labels(for:photo),labelChanged:{if let label=$0{store.toggleLabel(label,photo:photo)}else{store.clearLabels(photo)}}, rejected: store.state.rejected.contains(photo.id), navigatorTopInset: 60,
                         previous: { store.navigate(-1) }, next: { store.navigate(1) },
                         mark: { if let current = store.focused { store.toggleReject(current) } })
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .id(photo.id).frame(maxWidth: .infinity, maxHeight: .infinity)
                     if !chrome.visible && store.state.rejected.contains(photo.id) {
                         VStack { HStack { Spacer(); Image(systemName: "trash.fill").foregroundStyle(.white).padding(9).background(.red, in: Circle()) }; Spacer() }.padding(16).allowsHitTesting(false)
                     }
@@ -386,16 +393,18 @@ struct ViewerView: View {
                 VStack {
                     FloatingTools {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(store.focused?.name ?? "没有照片").font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                            HStack(spacing:5){Text(store.focused?.name ?? "没有照片").font(.system(size: 13, weight: .semibold)).lineLimit(1);if let photo=store.focused,!store.labels(for:photo).isEmpty{PhotoLabelDots(labels:store.labels(for:photo))}}
                             Text(store.albums.first { $0.id == store.focused?.albumID }?.title ?? "").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                         }.frame(maxWidth: 160, alignment: .leading)
                         if let photo = store.focused, store.state.rejected.contains(photo.id) { Image(systemName: "trash.fill").foregroundStyle(.red).help("待删除") }
                         Divider().frame(height: 22)
                         if let photo = store.focused {
                             if let score = store.assessments[photo.id]?.aesthetics { ScoreBadge(score: score) }
+                            Button { editingPhoto = photo } label: { Label("编辑", systemImage: "slider.horizontal.3") }.disabled(photo.files.allSatisfy(\.isRAW) || photo.ambiguous || store.busy).help("编辑 JPG，覆盖保存并保留最初备份")
                             Button { evaluate(photo) } label: { Label("评测", systemImage: "sparkles") }.disabled(store.assessing.contains(photo.id)).help("在本机评测当前照片")
                         }
-                        Button { info.togglePin() } label: { Label(info.pinned ? "取消固定评测" : "固定评测信息", systemImage: info.pinned ? "pin.fill" : "sidebar.right") }.labelStyle(.iconOnly).help(info.pinned ? "取消固定，靠近右侧自动显示" : "固定评测信息，避免遮挡图片")
+                        Divider().frame(height: 22)
+                        Button { info.togglePin() } label: { Label(info.pinned ? "取消固定评测" : "固定评测信息", systemImage: "sidebar.right") }.labelStyle(.iconOnly).help(info.pinned ? "取消固定，靠近右侧自动显示" : "固定评测信息，避免遮挡图片")
                         NavigatorToggle(visible: $store.navigatorVisible)
                         Button { chrome.togglePin() } label: { Label(chrome.pinned ? "自动隐藏工具" : "固定工具", systemImage: chrome.pinned ? "pin.fill" : "pin") }.labelStyle(.iconOnly).help(chrome.pinned ? "工具栏已固定，点击恢复自动隐藏（H）" : "工具栏自动隐藏，点击固定（H）")
                         Button { store.viewerController?.window?.toggleFullScreen(nil) } label: { Label(store.viewerFullScreen ? "退出全屏" : "全屏", systemImage: store.viewerFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") }.labelStyle(.iconOnly).help(store.viewerFullScreen ? "退出全屏" : "全屏")
@@ -422,7 +431,17 @@ struct ViewerView: View {
                     .environmentObject(store).frame(width: 280).modifier(PhotoGlass()).padding(12).padding(.top, store.viewerFullScreen ? 0 : 28)
             }
         }.overlay(alignment: .top) { WindowHeaderMaterial().frame(height: store.viewerFullScreen ? 0 : 28).allowsHitTesting(false) }.ignoresSafeArea(.container, edges: .top).frame(minWidth: 700, minHeight: 480).background(.black).preferredColorScheme(.dark)
-            .background(ChromeTracking(state: chrome, inspector: info, inspectorEnabled: store.focused.map { store.assessments[$0.id] != nil || store.assessing.contains($0.id) } ?? false).frame(width: 0, height: 0))
+            .accessibilityHidden(editingPhoto != nil).allowsHitTesting(editingPhoto == nil)
+            .background { if editingPhoto == nil { ChromeTracking(state: chrome, inspector: info, inspectorEnabled: store.focused.map { store.assessments[$0.id] != nil || store.assessing.contains($0.id) } ?? false).frame(width: 0, height: 0) } }
+        .overlay {
+            if let photo = editingPhoto {
+                PhotoEditorView(photo: photo, directory: store.stateURL.deletingLastPathComponent()) { closeWindow in
+                    store.editorActive = false; store.editorCloseRequest = nil; editingPhoto = nil
+                    if closeWindow { store.viewerController?.close() }
+                }.environmentObject(store)
+            }
+        }
+
     }
     private func evaluate(_ photo: Photo) { store.assessPhoto(photo); info.reveal(); chrome.reveal(); chrome.scheduleHide() }
 }

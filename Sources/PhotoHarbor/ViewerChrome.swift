@@ -156,8 +156,8 @@ struct NavigatorToggle: View {
     var body: some View {
         Button { visible.toggle() } label: {
             Label(visible ? "导航已开启" : "导航已关闭", systemImage: visible ? "rectangle.inset.filled" : "rectangle")
-                .labelStyle(.iconOnly).foregroundStyle(visible ? Color.accentColor : .secondary)
-                .padding(4).background(visible ? Color.accentColor.opacity(0.16) : .clear, in: RoundedRectangle(cornerRadius: 5))
+                .labelStyle(.iconOnly).foregroundStyle(.primary)
+                .padding(4)
         }.help(visible ? "导航已开启，点击隐藏缩放预览" : "导航已关闭，点击显示缩放预览")
             .accessibilityValue(visible ? "开启" : "关闭")
     }

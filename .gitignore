@@ -51,3 +51,11 @@
 *.HEIC
 state.json
 import-*.json
+
+# Personal color-grading assets remain in the local LUT library
+*.cube
+*.CUBE
+.photoharbor-originals/
+.photoharbor-marks/
+*.xmp
+*.XMP

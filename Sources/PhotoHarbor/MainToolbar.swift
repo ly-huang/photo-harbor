@@ -24,8 +24,8 @@ struct MainToolbar: NSViewRepresentable {
         func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, actions] }
         func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
             guard id == actions else { return nil }
-            let labels = ["重新扫描", "打开相册", "导入照片"]
-            let symbols = ["arrow.clockwise", "folder.badge.plus", "square.and.arrow.down"]
+            let labels = ["重新扫描", "打开相册", "导入照片", "滤镜 / LUT 管理"]
+            let symbols = ["arrow.clockwise", "folder.badge.plus", "square.and.arrow.down", "cube.transparent"]
             let images = zip(symbols, labels).map { symbol, label in
                 let image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)!
                     .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 16, weight: .regular))!
@@ -69,6 +69,7 @@ struct MainToolbar: NSViewRepresentable {
             case 0: if !store.albums.isEmpty { store.scan() }
             case 1: store.settings = true
             case 2: store.importing = true
+            case 3: LUTManagerController.show(directory: store.stateURL.deletingLastPathComponent())
             default: break
             }
         }

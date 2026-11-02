@@ -6,3 +6,5 @@ ruby scripts/test-repository.rb
 zsh scripts/test-core.sh
 zsh scripts/test-store.sh
 zsh scripts/test-viewer.sh
+zsh scripts/test-editor.sh
+zsh scripts/test-marks.sh

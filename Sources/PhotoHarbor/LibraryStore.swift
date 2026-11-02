@@ -4,6 +4,8 @@ import AppKit
 @MainActor final class LibraryStore: ObservableObject {
     @Published var state = SavedState()
     @Published var photos: [Photo] = []
+    @Published var annotations:[String:PhotoAnnotation]=[:]
+    @Published var labelFilter:PhotoLabel?
     @Published var selected: String?
     @Published var filter = "全部照片"
     @Published var album: String?
@@ -15,6 +17,12 @@ import AppKit
     @Published var error: String?
     @Published var settings = false
     @Published var importing = false
+    @Published var editorActive = false
+    var editorCloseRequest: (() -> Void)?
+    @Published var editorCanUndo = false
+    @Published var editorCanRedo = false
+    var editorUndo: (() -> Void)?
+    var editorRedo: (() -> Void)?
     @Published var viewer = false
     @Published var viewerFullScreen = false
     @Published var navigatorVisible = true
@@ -71,11 +79,12 @@ import AppKit
     var focused: Photo? { photos.first { $0.id == selected } }
     var albums: [OpenAlbum] { state.albums }
     var albumTitle: String? { albums.first { $0.id == album }?.title }
-    var rejected: [Photo] { photos.filter { state.rejected.contains($0.id) && (album == nil || $0.albumID == album) } }
+    var rejected: [Photo] { photos.filter { state.rejected.contains($0.id) && (album == nil || $0.albumID == album) && (labelFilter == nil || labels(for:$0).contains(labelFilter!)) } }
     var undoBatches: [DeletionBatch] { state.deletionBatches.filter { (album == nil || $0.albumID == album) && !unavailable.contains($0.albumID) }.reversed() }
     var visible: [Photo] {
         photos.filter { photo in
             (album == nil || photo.albumID == album) &&
+            (labelFilter == nil || annotations[photo.id]?.colors.contains(labelFilter!) == true) &&
             (search.isEmpty || photo.name.localizedCaseInsensitiveContains(search) || photo.album.localizedCaseInsensitiveContains(search) || (albums.first { $0.id == photo.albumID }?.title.localizedCaseInsensitiveContains(search) ?? false)) &&
             (filter != "待删除" || state.rejected.contains(photo.id)) &&
             (filter != "未配对" || !photo.paired) &&
@@ -108,6 +117,22 @@ import AppKit
                 results += scanned
             } catch { failed.insert(item.id) }
         }
+        let markPhotos=results,legacy=state.rejected
+        let loaded=await Task.detached { () -> ([String:PhotoAnnotation],Int) in
+            var marks:[String:PhotoAnnotation]=[:],errors=0
+            for photo in markPhotos {
+                do{marks[photo.id]=try PhotoMarkStorage.load(photo,legacyRejected:legacy.contains(photo.id))}
+                catch{
+                    errors+=1
+                    let existing=photo.files.contains{FileManager.default.fileExists(atPath:PhotoMarkStorage.url($0).path)}
+                    marks[photo.id]=PhotoAnnotation(rejected:!existing && legacy.contains(photo.id))
+                }
+            }
+            return(marks,errors)
+        }.value
+        annotations=loaded.0
+        state.rejected=Set(results.filter{annotations[$0.id]?.rejected==true}.map(\.id))
+        if loaded.1>0{error="\(loaded.1) 张照片的目录标记未能读取或迁移，请检查权限及隐藏记录；未对这些照片启用删除标记。"}
         photos = results; unavailable = failed
         state.pruneHistory(availableAlbumIDs: Set(state.albums.map(\.id)).subtracting(failed))
         let currentIDs = Set(results.map(\.id))
@@ -118,6 +143,22 @@ import AppKit
         trusted = !state.albums.isEmpty
         reconcileSelection(); save()
         status = "\(photos.count) 张照片，\(photos.filter(\.paired).count) 对 JPG + RAW" + (failed.isEmpty ? "" : "；\(failed.count) 个相册无法访问，已清除其撤销记录")
+    }
+    func reloadAfterEditing(_ url: URL) async {
+        busy = true
+        let oldPhoto=photos.first{$0.files.contains{$0.url==url}}
+        let oldColors=oldPhoto.flatMap{annotations[$0.id]?.colors} ?? []
+        await reloadAlbums()
+        if let edited = photos.first(where: { $0.files.contains(where: { $0.url == url }) }) {
+            selected = edited.id
+            if !oldColors.isEmpty {
+                let annotation=PhotoAnnotation(colors:oldColors,rejected:false)
+                do{try await Task.detached{try PhotoMarkStorage.save(annotation,for:edited)}.value;annotations[edited.id]=annotation;state.rejected.remove(edited.id);save()}
+                catch{self.error="照片已保存，颜色标记未能更新到新版本：\(error.localizedDescription)"}
+            }
+        }
+        ImageCache.shared.cache.removeAllObjects()
+        busy = false
     }
     func select(_ photo: Photo) { selected = photo.id }
     func reconcileSelection() {
@@ -130,10 +171,23 @@ import AppKit
         let result = await Task.detached { Metadata.read(photo.preview) }.value
         if selected == id { metadata = result }
     }
+    func labels(for photo:Photo)->Set<PhotoLabel>{annotations[photo.id]?.colors ?? []}
+    func toggleLabel(_ label:PhotoLabel,photo:Photo){var a=annotations[photo.id] ?? PhotoAnnotation(rejected:state.rejected.contains(photo.id));if a.colors.contains(label){a.colors.remove(label)}else{a.colors.insert(label)};writeAnnotation(a,photo:photo)}
+    func clearLabels(_ photo:Photo){var a=annotations[photo.id] ?? PhotoAnnotation(rejected:state.rejected.contains(photo.id));a.colors=[];writeAnnotation(a,photo:photo)}
     func toggleReject(_ photo: Photo) {
-        guard !busy else { return }
-        if state.rejected.contains(photo.id) { state.rejected.remove(photo.id) } else { state.rejected.insert(photo.id) }
-        save()
+        var a=annotations[photo.id] ?? PhotoAnnotation();a.rejected = !state.rejected.contains(photo.id);writeAnnotation(a,photo:photo)
+    }
+    private func writeAnnotation(_ annotation:PhotoAnnotation,photo:Photo){
+        guard !busy else{return};busy=true
+        Task {
+            defer{busy=false}
+            do {
+                try await Task.detached{try PhotoMarkStorage.save(annotation,for:photo)}.value
+                annotations[photo.id]=annotation
+                if annotation.rejected{state.rejected.insert(photo.id)}else{state.rejected.remove(photo.id)}
+                save();reconcileSelection();status="已保存照片目录中的标记。"
+            } catch{self.error="标记保存失败，未更新标记：\(error.localizedDescription)"}
+        }
     }
     func navigate(_ offset: Int) {
         let list = visible
@@ -169,6 +223,7 @@ import AppKit
         guard !busy else { return }
         let ids = Set(photos.filter { $0.albumID == id }.map(\.id))
         state.rejected.subtract(ids)
+        annotations=annotations.filter{!ids.contains($0.key)}
         comparisonSelection.removeAll { ids.contains($0) }
         state.deletionBatches.removeAll { $0.albumID == id }
         state.albums.removeAll { $0.id == id }
@@ -179,6 +234,7 @@ import AppKit
         status = "已关闭相册，磁盘照片保留。"
     }
     func showViewer() {
+        guard !editorActive else { viewerController?.window?.makeKeyAndOrderFront(nil); return }
         viewer = true
         if let controller = viewerController, let window = controller.window {
             // Reuse the existing fullscreen window and bring its Space forward.
@@ -256,6 +312,7 @@ import AppKit
                         }
                         state.deletionBatches[index].records.append(record)
                         try persist(); count += 1
+                        try await Task.detached{try PhotoMarkStorage.consumeRejection(file)}.value
                     }
                     state.rejected.remove(photo.id); try persist()
                 }

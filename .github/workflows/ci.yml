@@ -22,4 +22,4 @@ jobs:
       - name: Privacy and tests
         run: zsh scripts/check.sh
       - name: Build app
-        run: zsh scripts/build-app.sh
+        run: zsh scripts/build-app.sh --release

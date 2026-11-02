@@ -2,22 +2,36 @@
 set -euo pipefail
 cd "${0:A:h:h}"
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/clang-cache"
-mkdir -p .build/release
-xcrun swiftc -O -parse-as-library -swift-version 5 -module-name PhotoHarbor \
-  -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
-  -target "$(uname -m)-apple-macosx14.0" Sources/PhotoHarbor/*.swift -o .build/release/PhotoHarbor
-app="${PWD}/dist.noindex/拾影.app"
+configuration=${PHOTOHARBOR_BUILD_CONFIGURATION:-debug}
+if [[ "${1:-}" == '--release' ]]; then configuration=release; fi
+if [[ "$configuration" != debug && "$configuration" != release ]]; then print -u2 'Build configuration must be debug or release'; exit 1; fi
+mkdir -p .build dist.noindex
+zsh scripts/compile-app.sh "$configuration"
+binary_dir="$PWD/.build/incremental/$configuration"
+staging_root=$(mktemp -d "$PWD/.build/app-stage.XXXXXX")
+cleanup_build() { rm -rf "$staging_root"; }
+trap cleanup_build EXIT
+app="$staging_root/拾影.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp .build/release/PhotoHarbor "$app/Contents/MacOS/PhotoHarbor"
+cp "$binary_dir/PhotoHarbor" "$app/Contents/MacOS/PhotoHarbor"
 # Only the approved source artwork is versioned; all generated icon files stay local.
 icon_build="$PWD/.build/app-icon"
 mkdir -p "$icon_build"
-xcrun swift -module-cache-path "$CLANG_MODULE_CACHE_PATH" scripts/prepare-system-icon.swift "$PWD/assets/AppIcon/master.png" "$icon_build/master.png" 0 0 1024 1024
-if [[ ! -f "$icon_build/AppIcon.icns" ]] || ! cmp -s "$icon_build/master.png" "$icon_build/AppIcon.iconset/icon_512x512@2x.png"; then
+icon_input=$(ruby -rdigest -e 'd=Digest::SHA256.new;ARGV.each{|f|d<<File.binread(f)};puts d.hexdigest' assets/AppIcon/master.png scripts/prepare-system-icon.swift scripts/package-icon.swift scripts/verify-icon.swift)
+icon_output=missing
+if [[ -f "$icon_build/AppIcon.icns" ]]; then icon_output=$(shasum -a 256 "$icon_build/AppIcon.icns" | cut -d' ' -f1); fi
+if [[ ! -f "$icon_build/verified.cache" || "$(cat "$icon_build/verified.cache")" != "$icon_input $icon_output" ]]; then
+  rm -f "$icon_build/verified.cache"
+  xcrun swift -module-cache-path "$CLANG_MODULE_CACHE_PATH" scripts/prepare-system-icon.swift "$PWD/assets/AppIcon/master.png" "$icon_build/master.png" 0 0 1024 1024
   xcrun swift -module-cache-path "$CLANG_MODULE_CACHE_PATH" scripts/package-icon.swift "$icon_build/master.png" "$icon_build/AppIcon.iconset" "$icon_build/AppIcon.icns"
+  xcrun swift -module-cache-path "$CLANG_MODULE_CACHE_PATH" scripts/verify-icon.swift "$PWD/assets/AppIcon/master.png" "$icon_build/master.png" "$icon_build/AppIcon.icns"
+  icon_output=$(shasum -a 256 "$icon_build/AppIcon.icns" | cut -d' ' -f1)
+  print -r -- "$icon_input $icon_output" > "$icon_build/verified.cache"
+else
+  print 'Using verified icon cache'
 fi
-cp "$icon_build/AppIcon.icns" "$app/Contents/Resources/AppIconPearlWhite.icns"
-rm -f "$app/Contents/Resources/AppIconGlass.icns"
+cp "$icon_build/AppIcon.icns" "$app/Contents/Resources/AppIconPearlWhiteSized.icns"
+rm -f "$app/Contents/Resources/AppIconPearlWhiteAlpha.icns" "$app/Contents/Resources/AppIconPearlWhite.icns" "$app/Contents/Resources/AppIconGlass.icns"
 rm -f "$app/Contents/Resources/AppIcon.icns" "$app/Contents/Resources/AppIconDock.png" "$app/Contents/Resources/AppIcon-v2.icns" "$app/Contents/Resources/AppIcon-v3.icns" "$app/Contents/Resources/AppIcon-v4.icns" "$app/Contents/Resources/AppIcon-v5.icns"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -28,10 +42,10 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>拾影</string>
 <key>CFBundleDisplayName</key><string>拾影 Photo Harbor</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleIconFile</key><string>AppIconPearlWhite</string>
+<key>CFBundleIconFile</key><string>AppIconPearlWhiteSized</string>
 <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-<key>CFBundleShortVersionString</key><string>0.7.4</string>
-<key>CFBundleVersion</key><string>22</string>
+<key>CFBundleShortVersionString</key><string>1.1.2</string>
+<key>CFBundleVersion</key><string>30</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -42,4 +56,7 @@ codesign --force --sign - "$app"
 # IconServices keys some cached artwork by the bundle directory timestamp.
 touch "$app"
 # Development output stays in dist.noindex; register only the installed bundle.
-print "已生成：$app"
+output="$PWD/dist.noindex/拾影.app"
+if [[ -e "$output" ]]; then mv "$output" "$staging_root/previous.app"; fi
+mv "$app" "$output"
+print "已生成：$output ($configuration)"

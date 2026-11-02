@@ -22,9 +22,10 @@ import AppKit
             CommandMenu("照片") {
                 Button("重新扫描") { store.scan() }.keyboardShortcut("r").disabled(store.busy)
                 Button("查看大图") { if store.focused != nil { store.showViewer() } }.keyboardShortcut(.return, modifiers: [])
-                Button("标记 / 取消待删除") { if let photo = store.focused { store.toggleReject(photo) } }.keyboardShortcut(.delete, modifiers: []).disabled(store.focused == nil || store.busy)
+                Button("标记 / 取消待删除") { if let photo = store.focused { store.toggleReject(photo) } }.keyboardShortcut(.delete, modifiers: []).disabled(store.focused == nil || store.busy || store.editorActive)
                 Divider()
-                Button("撤销最近一批删除") { store.undoTrash() }.keyboardShortcut("z").disabled(store.busy || store.undoBatches.isEmpty)
+                Button(store.editorActive ? "撤销编辑" : "撤销最近一批删除") { if store.editorActive { store.editorUndo?() } else { store.undoTrash() } }.keyboardShortcut("z").disabled(store.editorActive ? !store.editorCanUndo : (store.busy || store.undoBatches.isEmpty))
+                Button("重做编辑") { store.editorRedo?() }.keyboardShortcut("z", modifiers: [.command, .shift]).disabled(!store.editorActive || !store.editorCanRedo)
                 Button("查看删除记录…") { store.history = true }
             }
         }

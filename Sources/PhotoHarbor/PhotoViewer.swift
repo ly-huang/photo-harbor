@@ -34,6 +34,10 @@ private actor PhotoDecoder {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
     func windowDidEnterFullScreen(_ notification: Notification) { store?.viewerFullScreen = true }
     func windowDidExitFullScreen(_ notification: Notification) { store?.viewerFullScreen = false }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if let request = store?.editorCloseRequest { request(); return false }
+        return true
+    }
     func windowWillClose(_ notification: Notification) {
         store?.viewerFullScreen = false
         store?.viewer = false
@@ -47,10 +51,27 @@ struct InteractivePhoto: NSViewRepresentable {
     let fitToken: Int
     let fullScreen: Bool
     var navigatorVisible = true
+    var overrideImage: CGImage? = nil
+    var comparisonImage: CGImage? = nil
+    var comparisonEditedImage: CGImage? = nil
+    var comparisonActive = false
+    var rotationActive = false
+    var brushTool: CorrectionTool? = nil
+    var brushDiameter = 0.035
+    var paint: ((CGPoint)->Void)? = nil
+    var painting: ((Bool)->Void)? = nil
+    var cropActive = false
+    var cropAspect: CGFloat? = nil
+    var cropSelection: CGRect? = nil
+    var cropChanged: ((CGRect) -> Void)? = nil
+    var exit: (() -> Void)? = nil
     var evaluate: (() -> Void)? = nil
     var showInfo: (() -> Void)? = nil
     var activated: (() -> Void)? = nil
     var toggleNavigator: (() -> Void)? = nil
+    var labels:Set<PhotoLabel>=[]
+    var labelChanged:((PhotoLabel?)->Void)?=nil
+    var contextMarkAction:(()->Void)?=nil
     var rejected = false
     var navigatorTopInset: CGFloat = 0
     let previous: () -> Void
@@ -60,17 +81,53 @@ struct InteractivePhoto: NSViewRepresentable {
     func updateNSView(_ view: PhotoCanvas, context: Context) {
         view.previous = previous; view.next = next; view.mark = mark
         view.evaluate = evaluate; view.showInfo = showInfo; view.activated = activated
+        view.labels=labels;view.labelChanged=labelChanged;view.contextMarkAction=contextMarkAction
         view.toggleNavigator = toggleNavigator; view.rejected = rejected
         view.navigatorTopInset = navigatorTopInset
         view.fullScreen = fullScreen
         view.navigatorVisible = navigatorVisible
-        if view.url != url { view.load(url) }
+        view.exit = exit
+        view.comparisonActive = comparisonActive
+        if view.rotationActive != rotationActive { view.rotationActive = rotationActive; view.fit(); view.window?.invalidateCursorRects(for: view) }
+        view.comparisonEditedImage = comparisonEditedImage.map { NSImage(cgImage: $0, size: .zero) }
+        view.comparisonImage = comparisonImage.map { NSImage(cgImage: $0, size: .zero) }
+        if view.cropActive != cropActive { view.cropActive = cropActive; view.fit(); view.window?.invalidateCursorRects(for: view) }
+        if view.cropDragMode == -1 { view.cropSelection = cropSelection }
+        view.brushTool=brushTool;view.brushDiameter=brushDiameter;view.paint=paint;view.painting=painting
+        view.cropChanged = cropChanged
+        view.cropAspect = cropAspect
+        if cropActive || rotationActive { view.splitHeld = false }
+        view.needsDisplay = true
+        if let overrideImage { view.present(overrideImage) } else if view.url != url { view.load(url) }
         if view.fitToken != fitToken { view.fitToken = fitToken; view.fit() }
     }
     static func dismantleNSView(_ view: PhotoCanvas, coordinator: ()) { view.dispose() }
 }
 
 final class PhotoCanvas: NSView {
+    var exit: (() -> Void)?
+    private var presented: CGImage?
+    var comparisonImage: NSImage?
+    var comparisonEditedImage: NSImage?
+    var splitHeld = false
+    var isComparing: Bool { comparisonActive || splitHeld }
+    var brushTool: CorrectionTool?
+    var brushDiameter = 0.035
+    var brushPoint: CGPoint?
+    var paint: ((CGPoint)->Void)?
+    var painting: ((Bool)->Void)?
+    private var paintingStroke = false
+    var rotationActive = false
+    var comparisonActive = false
+    var comparisonX: CGFloat?
+    var cropActive = false
+    var cropAspect: CGFloat?
+    var cropSelection: CGRect?
+    var cropChanged: ((CGRect) -> Void)?
+    var cropStart = CGPoint.zero
+    var cropInitial = CGRect.zero
+    var cropDragMode = -1
+    var editingImageRect: CGRect { ViewerGeometry.imageRect(viewport: bounds.size, fitSize: fitSize, zoom: zoom, offset: offset) }
     var previous: (() -> Void)?
     var next: (() -> Void)?
     var mark: (() -> Void)?
@@ -78,6 +135,9 @@ final class PhotoCanvas: NSView {
     var showInfo: (() -> Void)?
     var activated: (() -> Void)?
     var toggleNavigator: (() -> Void)?
+    var labels:Set<PhotoLabel>=[]
+    var labelChanged:((PhotoLabel?)->Void)?
+    var contextMarkAction:(()->Void)?
     var rejected = false
     var navigatorTopInset: CGFloat = 0
     var url: URL?
@@ -100,7 +160,12 @@ final class PhotoCanvas: NSView {
     override func isAccessibilityElement() -> Bool { true }
     override func accessibilityRole() -> NSAccessibility.Role? { .image }
     override func accessibilityLabel() -> String? { "照片画布" }
-    override func accessibilityValue() -> Any? { "适应比例 \(Int(zoom * 100))%" + (showsNavigator ? "，全图导航已显示" : "") }
+    override func accessibilityValue() -> Any? {
+        var value = "适应比例 \(Int(zoom * 100))%" + (showsNavigator ? "，全图导航已显示" : "")
+        if cropActive, let r = cropSelection { value += String(format: "，裁剪框 X %.1f%% Y %.1f%% 宽 %.1f%% 高 %.1f%%", r.minX * 100, r.minY * 100, r.width * 100, r.height * 100) }
+        if isComparing { value += "，分割对比：左侧编辑前，右侧编辑后" }
+        return value
+    }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); window?.makeFirstResponder(self) }
     func load(_ url: URL) {
@@ -124,6 +189,13 @@ final class PhotoCanvas: NSView {
             }
             self.needsDisplay = true
         }
+    }
+    func present(_ image: CGImage) {
+        guard presented !== image else { return }
+        presented = image; loading?.cancel()
+        self.image = NSImage(cgImage: image, size: .zero)
+        self.navigatorImage = self.image
+        clampOffset(); needsDisplay = true
     }
     func dispose() { loading?.cancel() }
     func fit() {
@@ -153,8 +225,10 @@ final class PhotoCanvas: NSView {
             return
         }
         let rect = ViewerGeometry.imageRect(viewport: bounds.size, fitSize: fitSize, zoom: zoom, offset: offset)
-        image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
-        if showsNavigator { drawNavigator(image) }
+        let base = isComparing ? (comparisonEditedImage ?? image) : image
+        base.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
+        drawEditing(in: rect)
+        if showsNavigator && !cropActive && !rotationActive && brushTool == nil { drawNavigator(image) }
     }
     private var showsNavigator: Bool { navigatorVisible && zoom > 1.001 && image != nil }
     private var thumbnailRect: NSRect {
@@ -196,18 +270,22 @@ final class PhotoCanvas: NSView {
         tracking = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .cursorUpdate, .mouseEnteredAndExited, .mouseMoved], owner: self)
         addTrackingArea(tracking!); super.updateTrackingAreas()
     }
-    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: editingCursor) }
     override func cursorUpdate(with event: NSEvent) {
         guard let root = window?.contentView else { return }
         let hit = root.hitTest(root.convert(event.locationInWindow, from: nil))
-        if hit === self { (dragging ? NSCursor.closedHand : NSCursor.openHand).set() }
+        if hit === self { (dragging ? NSCursor.closedHand : editingCursor).set() }
         else { NSCursor.arrow.set() }
     }
-    override func mouseExited(with event: NSEvent) { NSCursor.arrow.set() }
+    override func mouseExited(with event: NSEvent) { splitHeld = false; brushPoint=nil; needsDisplay = true; NSCursor.arrow.set() }
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         activated?()
         let point = convert(event.locationInWindow, from: nil)
+        if brushTool != nil { paintingStroke=true;painting?(true);paintAt(point);return }
+        if rotationActive { return }
+        if cropActive { beginCrop(at: point); NSCursor.crosshair.set(); return }
+        if isComparing { comparisonX = point.x; needsDisplay = true }
         if showsNavigator && thumbnailRect.insetBy(dx: -8, dy: -8).contains(point) {
             navigatorDragging = true
             let viewport = navigatorViewport
@@ -218,12 +296,19 @@ final class PhotoCanvas: NSView {
         dragging = true; NSCursor.closedHand.set()
     }
     override func mouseDragged(with event: NSEvent) {
+        if paintingStroke { paintAt(convert(event.locationInWindow,from:nil));return }
+        if splitHeld { comparisonX = convert(event.locationInWindow, from: nil).x; needsDisplay = true; return }
+        if cropActive { dragCrop(to: convert(event.locationInWindow, from: nil)); return }
         if navigatorDragging { moveNavigator(to: convert(event.locationInWindow, from: nil)); return }
         offset.x += event.deltaX; offset.y += event.deltaY
         clampOffset(); needsDisplay = true
     }
-    override func mouseUp(with event: NSEvent) { dragging = false; navigatorDragging = false; NSCursor.openHand.set() }
+    override func mouseUp(with event: NSEvent) { if paintingStroke { paintingStroke=false;painting?(false) };if cropActive { finishCrop(); cropDragMode = -1 }; dragging = false; navigatorDragging = false; editingCursor.set() }
     override func mouseMoved(with event: NSEvent) {
+        if brushTool != nil { brushPoint=convert(event.locationInWindow,from:nil);needsDisplay=true;return }
+        updateSplit(flags: event.modifierFlags, point: convert(event.locationInWindow, from: nil))
+        if rotationActive { return }
+        if cropActive { return }
         if spaceHeld && !navigatorDragging {
             offset.x += event.deltaX; offset.y += event.deltaY
             clampOffset(); needsDisplay = true; NSCursor.closedHand.set()
@@ -240,15 +325,35 @@ final class PhotoCanvas: NSView {
         if evaluate != nil { add("评测此图片", #selector(contextEvaluate)) }
         if showInfo != nil { add("查看评测信息", #selector(contextInfo)) }
         menu.addItem(.separator())
+if labelChanged != nil {
+            let parent=NSMenuItem(title:"颜色标记",action:nil,keyEquivalent:""),submenu=NSMenu()
+            for (i,label) in PhotoLabel.allCases.enumerated(){
+                let item=NSMenuItem(title:label.rawValue,action:#selector(contextLabel(_:)),keyEquivalent:"");item.target=self;item.tag=i;item.state=labels.contains(label) ? .on:.off
+                item.attributedTitle=label.menuTitle;submenu.addItem(item)
+            }
+            submenu.addItem(.separator());let clear=NSMenuItem(title:"移除所有颜色标记",action:#selector(contextLabel(_:)),keyEquivalent:"");clear.target=self;clear.tag = -1;clear.isEnabled = !labels.isEmpty;submenu.addItem(clear);parent.submenu=submenu;menu.addItem(parent)
+        }
         add(rejected ? "取消待删除" : "标记待删除", #selector(contextMark))
         add(navigatorVisible ? "隐藏导航预览" : "显示导航预览", #selector(contextNavigator))
         return menu
     }
+    @objc private func contextLabel(_ item:NSMenuItem){labelChanged?(item.tag>=0 ? PhotoLabel.allCases[item.tag]:nil)}
     @objc private func contextFit() { fit() }
     @objc private func contextEvaluate() { evaluate?() }
     @objc private func contextInfo() { showInfo?() }
-    @objc private func contextMark() { mark?() }
+    @objc private func contextMark() { if let contextMarkAction{contextMarkAction()}else{mark?()} }
     @objc private func contextNavigator() { if let toggleNavigator { toggleNavigator() } else { navigatorVisible.toggle() } }
+    private func paintAt(_ point:CGPoint) {
+        let r=editingImageRect;guard r.contains(point),r.width>0,r.height>0 else{return}
+        brushPoint=point;paint?(CGPoint(x:(point.x-r.minX)/r.width,y:(point.y-r.minY)/r.height));needsDisplay=true
+    }
+    private func updateSplit(flags: NSEvent.ModifierFlags, point: CGPoint) {
+        let held = flags.contains(.option) && comparisonImage != nil && !cropActive && !rotationActive && brushTool == nil
+        if held != splitHeld || held { splitHeld = held; comparisonX = point.x; needsDisplay = true }
+    }
+    override func flagsChanged(with event: NSEvent) {
+        updateSplit(flags: event.modifierFlags, point: convert(window?.mouseLocationOutsideOfEventStream ?? .zero, from: nil))
+    }
     override func keyDown(with event: NSEvent) {
         let characters = event.charactersIgnoringModifiers?.lowercased()
         if characters == "f", event.modifierFlags.intersection([.command, .control, .option]).isEmpty { fit(); return }
@@ -261,6 +366,7 @@ final class PhotoCanvas: NSView {
         case 3: fit()
         case 29 where event.modifierFlags.contains(.command): fit()
         case 53:
+            if let exit { exit(); return }
             if window?.styleMask.contains(.fullScreen) == true { window?.toggleFullScreen(nil) }
             else { window?.close() }
         default: super.keyDown(with: event)
@@ -268,6 +374,7 @@ final class PhotoCanvas: NSView {
     }
     override func keyUp(with event: NSEvent) { if event.keyCode == 49 { spaceHeld = false; NSCursor.openHand.set() } else { super.keyUp(with: event) } }
     override func scrollWheel(with event: NSEvent) {
+        if cropActive || rotationActive { return }
         guard image != nil else { return }
         anchor = convert(event.locationInWindow, from: nil)
         // Ignore synthesized inertia: zoom follows input immediately and stops on release.
@@ -275,6 +382,7 @@ final class PhotoCanvas: NSView {
         changeZoom(to: zoom * exp(event.scrollingDeltaY * (event.hasPreciseScrollingDeltas ? 0.008 : 0.055)))
     }
     override func magnify(with event: NSEvent) {
+        if cropActive || rotationActive { return }
         anchor = convert(event.locationInWindow, from: nil)
         changeZoom(to: zoom * (1 + event.magnification))
     }

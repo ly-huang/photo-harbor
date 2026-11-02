@@ -94,6 +94,30 @@ import Foundation
         store.scan(); try await wait(store)
         precondition(store.unavailable.contains(second.id) && store.state.deletionBatches.isEmpty)
         print("PASS unavailable album expires undo history")
-        print("7 store scenarios passed")
+
+        let marked=LibraryStore(stateURL:base.appendingPathComponent("marks-state.json"))
+        try marked.applyRoots(Roots(jpg:a.deletingLastPathComponent().path));try await wait(marked)
+        let target=marked.photos.first{$0.preview==a}!
+        marked.toggleLabel(.orange,photo:target);try await wait(marked)
+        marked.toggleLabel(.blue,photo:target);try await wait(marked)
+        marked.toggleReject(target);try await wait(marked)
+        precondition(marked.labels(for:target)==[.orange,.blue] && marked.state.rejected.contains(target.id))
+        marked.labelFilter = .orange;precondition(marked.visible.contains{$0.id==target.id})
+        marked.labelFilter = .gray;precondition(marked.visible.isEmpty && marked.rejected.isEmpty)
+        marked.labelFilter=nil;marked.closeAlbum(marked.albums[0].id)
+        try marked.applyRoots(Roots(jpg:a.deletingLastPathComponent().path));try await wait(marked)
+        precondition(marked.labels(for:target)==[.orange,.blue] && marked.state.rejected.contains(target.id))
+        let independent=LibraryStore(stateURL:base.appendingPathComponent("independent-state.json"))
+        try independent.applyRoots(Roots(jpg:a.deletingLastPathComponent().path));try await wait(independent)
+        precondition(independent.labels(for:target)==[.orange,.blue] && independent.state.rejected.contains(target.id))
+        try Data("fixture edited".utf8).write(to:a)
+        await independent.reloadAfterEditing(a)
+        let edited=independent.photos.first{$0.preview==a}!
+        precondition(independent.labels(for:edited)==[.orange,.blue] && !independent.state.rejected.contains(edited.id))
+        independent.clearLabels(edited);try await wait(independent)
+        independent.scan();try await wait(independent)
+        precondition(independent.labels(for:edited).isEmpty && !independent.state.rejected.contains(edited.id))
+        print("PASS color filtering, scoped delete targets, close/reopen and config-independent marks, color retention after app editing and persistent clear")
+        print("8 store scenarios passed")
     }
 }

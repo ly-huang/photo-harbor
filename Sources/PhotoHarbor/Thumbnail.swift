@@ -38,7 +38,7 @@ struct PhotoImage: View {
                 else { VStack(spacing: 8) { Image(systemName: "photo.badge.exclamationmark"); Text("无法预览 · 可在 Finder 查看").font(.caption) }.foregroundStyle(.secondary) }
             }
         }
-        .task(id: "\(url.path)-\(size)") {
+        .task(id: "\(url.path)-\(size)-\((try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?.timeIntervalSince1970 ?? 0)") {
             image = nil; loading = true
             let loaded = await ImageCache.shared.load(url, size: size)
             guard !Task.isCancelled else { return }
