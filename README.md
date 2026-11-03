@@ -22,6 +22,10 @@
 - **架构**：构建脚本生成当前 Mac 架构的应用，暂不生成 Universal Binary。旧版 macOS 和 Intel Mac 尚未完成全面实机验证。
 - **签名**：本地构建采用临时签名，不需要开发者证书。Developer ID 签名、公证和自动更新尚未提供。
 
+## 下载安装
+
+无需编译的用户可前往 [GitHub Releases](https://github.com/ly-huang/photo-harbor/releases/latest) 下载 Apple Silicon DMG，打开后将「拾影.app」拖入「Applications」。安装包附带 SHA-256 校验文件；当前版本未经 Apple 公证，首次打开可能受到系统安全检查限制。完整兼容性、签名状态和发布流程见[构建分发指南](docs/DISTRIBUTION.md)。
+
 ## 快速开始
 
 在仓库根目录执行：
@@ -85,6 +89,7 @@ open "/Applications/拾影.app"
 | [编辑系统](docs/EDITOR.md) | 调整工具、自动增强、滤镜格式、渲染及覆盖保存协议。 |
 | [标记与持久化](docs/MARKS.md) | 颜色 / 待删除标记、记录迁移、相册移动与恢复边界。 |
 | [开发指南](docs/DEVELOPMENT.md) | 构建、测试、隔离验证、安装及维护流程。 |
+| [构建分发](docs/DISTRIBUTION.md) | DMG 下载、校验、标签发布、工作流权限及签名边界。 |
 | [隐私与数据处理](docs/PRIVACY.md) | 本机数据、网络行为和公开仓库提交要求。 |
 | [贡献指南](CONTRIBUTING.md) | 开发与提交规范、文档维护要求。 |
 | [版本记录](CHANGELOG.md) | 各版本功能和修复摘要。 |

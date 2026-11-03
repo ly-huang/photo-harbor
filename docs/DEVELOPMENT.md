@@ -51,6 +51,7 @@ zsh scripts/check.sh
 | 检查入口 | 主要覆盖范围 |
 | --- | --- |
 | `check-repository.rb`、`test-repository.rb` | 已跟踪 / 暂存文件的隐私规则、敏感文件、路径与资源限制。 |
+| `test-distribution.rb` | 版本说明提取、非法标签与缺失版本章节的拒绝行为。 |
 | `test-core.sh` | 配对、歧义、日期、地点、复制校验、防覆盖、符号链接和文件身份。 |
 | `test-store.sh` | 多相册会话、对比选择、颜色筛选、删除范围、撤销批次、冲突及离线处理。 |
 | `test-viewer.sh` | 缩放与视野几何、工具栏、导航和评测面板生命周期。 |
@@ -114,7 +115,7 @@ zsh scripts/install-app.sh
 
 ## 持续集成
 
-GitHub Actions 使用 `macos-26`，执行仓库检查、全部脚本测试和 release 构建。Pull Request 还检查代码变更是否包含 CHANGELOG。CI 不安装应用，不上传测试照片或应用包。
+普通 GitHub Actions CI 使用 `macos-26`，执行仓库检查、全部脚本测试和 release 构建。Pull Request 还检查代码变更是否包含 CHANGELOG。该 CI 不安装应用或上传照片。独立的版本标签工作流负责生成并发布 DMG，详见[构建分发指南](DISTRIBUTION.md)。
 
 ## 维护与排错
 

@@ -1,0 +1,68 @@
+name: Release macOS DMG
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate release tag and architecture
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          [[ "$(uname -m)" == arm64 ]] || exit 1
+      - name: Run checks
+        run: zsh scripts/check.sh
+      - name: Build release app
+        run: zsh scripts/build-app.sh --release
+      - name: Package DMG and release notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          zsh scripts/package-dmg.sh
+          ruby scripts/release-notes.rb "$RELEASE_TAG" > dist.noindex/release/release-notes.md
+      - name: Upload verified release files
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-arm64
+          path: |
+            dist.noindex/release/*.dmg
+            dist.noindex/release/SHA256SUMS.txt
+            dist.noindex/release/release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-arm64
+          path: release
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        working-directory: release
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          sha256sum -c SHA256SUMS.txt
+          gh release create "$RELEASE_TAG" ./*.dmg SHA256SUMS.txt \
+            --verify-tag --draft --title "Photo Harbor $RELEASE_TAG" \
+            --notes-file release-notes.md
+          gh release edit "$RELEASE_TAG" --draft=false --latest
