@@ -9,6 +9,8 @@ struct LibraryView: View {
     @EnvironmentObject var store: LibraryStore
     @ViewState private var thumbnailSize: Double = 210
     @ViewState private var showingSelection = false
+    @ViewState private var exportPhotos: [Photo] = []
+    @ViewState private var showingExport = false
     var body: some View {
         HStack(spacing: 0) {
             sidebar.frame(width: 208)
@@ -46,6 +48,9 @@ struct LibraryView: View {
         .sheet(isPresented: $store.settings) { SettingsView() }
         .sheet(isPresented: $store.importing) { ImportView() }
         .sheet(isPresented: $store.history) { DeletionHistoryView() }
+        .sheet(isPresented: $showingExport) {
+            PhotoExportView(photos: exportPhotos, protected: Set(store.photos.flatMap(\.files).map(\.url)))
+        }
         .alert("操作未完成", isPresented: Binding(get: { store.error != nil }, set: { if !$0 { store.error = nil } })) { Button("知道了") { store.error = nil } } message: { Text(store.error ?? "") }
         .confirmationDialog("将 \(store.rejected.count) 张照片移入废纸篓？", isPresented: $store.confirmTrash, titleVisibility: .visible) {
             Button("移入废纸篓", role: .destructive) { store.deleteRejected() }
@@ -133,6 +138,11 @@ struct LibraryView: View {
                     ForEach(PhotoLabel.allCases,id:\.self){label in Button {store.labelFilter=label;store.reconcileSelection()} label:{Label{Text(label.rawValue)} icon:{Image(nsImage:label.menuImage).renderingMode(.original)}.labelStyle(.titleAndIcon)}}
                 } label:{Label(store.labelFilter.map{"\($0.rawValue)标记"} ?? "颜色标记",systemImage:"tag")}
                 if store.labelFilter != nil{Button{store.labelFilter=nil;store.reconcileSelection()}label:{Image(systemName:"xmark.circle.fill")}.buttonStyle(.borderless).help("清除标记筛选")}
+                if store.labelFilter != nil {
+                    Button { exportPhotos = store.visible; showingExport = true } label: {
+                        Label("导出筛选照片", systemImage: "square.and.arrow.up")
+                    }.disabled(store.busy || store.visible.isEmpty).help("导出当前颜色、相册、搜索及分类筛选后的照片")
+                }
                 Image(systemName: "square.grid.3x3").foregroundStyle(.secondary)
                 Slider(value: $thumbnailSize, in: 150...320).frame(width: 90).help("缩略图大小")
             }

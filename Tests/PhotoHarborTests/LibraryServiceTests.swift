@@ -4,6 +4,36 @@ import CoreGraphics
 @testable import PhotoHarbor
 
 final class LibraryServiceTests: XCTestCase {
+    func testFilteredExport() throws {
+        let jpg = try file("source/A.JPG", content: "new jpg")
+        _ = try file("source/A.ARW", content: "raw")
+        let files = try LibraryService.scanFiles(jpg.deletingLastPathComponent(), extensions: ["jpg", "arw"])
+        let protected = Set(files.map(\.url))
+        let output = base.appendingPathComponent("new/output")
+        for item in files {
+            let dest = PhotoExport.destination(item, folder: output, separate: true)
+            _ = try PhotoExport.copy(item, to: dest, protected: protected)
+            XCTAssertEqual(try Data(contentsOf: dest), try Data(contentsOf: item.url))
+        }
+        let item = files.first { !$0.isRAW }!
+        let dest = PhotoExport.destination(item, folder: output, separate: false)
+        _ = try file("new/output/A.JPG", content: "old")
+        let reviewed = try PhotoExport.reviewedTarget(dest)
+        XCTAssertEqual(try PhotoExport.copy(item, to: dest, choice: .skip, protected: protected), nil)
+        let renamed = try PhotoExport.copy(item, to: dest, protected: protected)!
+        XCTAssertEqual(renamed.lastPathComponent, "A (2).JPG")
+        XCTAssertEqual(try String(contentsOf: dest, encoding: .utf8), "old")
+        _ = try PhotoExport.copy(item, to: dest, choice: .replace, target: reviewed, protected: protected)
+        XCTAssertEqual(try Data(contentsOf: dest), try Data(contentsOf: jpg))
+        XCTAssertThrowsError(try PhotoExport.copy(item, to: dest, choice: .replace, target: reviewed, protected: protected))
+        let own = try PhotoExport.reviewedTarget(jpg)
+        XCTAssertThrowsError(try PhotoExport.copy(item, to: jpg, choice: .replace, target: own, protected: protected))
+        let link = base.appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: output)
+        XCTAssertThrowsError(try PhotoExport.copy(item, to: link.appendingPathComponent("A.JPG"), protected: protected))
+        _ = try file("source/A.JPG", content: "changed source")
+        XCTAssertThrowsError(try PhotoExport.copy(item, to: dest, protected: protected))
+    }
     var base: URL!
     override func setUpWithError() throws {
         base = canonicalURL(FileManager.default.temporaryDirectory).appendingPathComponent(UUID().uuidString)

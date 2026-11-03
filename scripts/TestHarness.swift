@@ -21,6 +21,7 @@ func XCTAssertThrowsError<T>(_ value: @autoclosure () throws -> T, file: StaticS
     static func main() throws {
         let suite = LibraryServiceTests()
         let tests: [(String, () throws -> Void)] = [
+            ("filtered export conflicts and safety", suite.testFilteredExport),
             ("relative pairing", suite.testRelativePairsStayWithinAlbumDespiteRepeatedNames),
             ("unique fallback and ambiguity", suite.testUniqueFallbackAndAmbiguousDuplicates),
             ("nested and offline roots", suite.testNestedAndDisconnectedRootsRejected),
