@@ -60,9 +60,16 @@ struct Photo: Identifiable, Sendable {
     var ambiguous = false
     var albumID = ""
     // Persist marks against this specific file generation, never just a reused camera name.
-    var id: String { files.map { "\($0.url.path)|\($0.identity)|\($0.bytes)|\($0.modified.timeIntervalSince1970)" }.sorted().joined(separator: "\n") }
+    let id: String
+    init(files: [PhotoFile], ambiguous: Bool = false, albumID: String = "") {
+        self.files = files
+        self.ambiguous = ambiguous
+        self.albumID = albumID
+        id = files.map { "\($0.url.path)|\($0.identity)|\($0.bytes)|\($0.modified.timeIntervalSince1970)" }.sorted().joined(separator: "\n")
+    }
     var name: String { files[0].url.deletingPathExtension().lastPathComponent }
-    var preview: URL { files.first(where: { !$0.isRAW })?.url ?? files[0].url }
+    var previewFile: PhotoFile { files.first(where: { !$0.isRAW }) ?? files[0] }
+    var preview: URL { previewFile.url }
     var paired: Bool { files.count == 2 && !ambiguous }
     var album: String {
         let directory = (files[0].relative as NSString).deletingLastPathComponent

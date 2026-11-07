@@ -20,7 +20,10 @@ struct LibraryView: View {
             VStack(spacing: 0) {
                 header
                 Divider()
-                if store.photos.isEmpty { emptyState }
+                if store.photos.isEmpty && store.scanningAlbums {
+                    ContentUnavailableView("正在扫描相册", systemImage: "folder", description: Text(store.status))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if store.photos.isEmpty { emptyState }
                 else {
                     ScrollView {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: thumbnailSize), spacing: 18)], spacing: 20) {
@@ -77,7 +80,8 @@ struct LibraryView: View {
         .onChange(of: store.visible.map(\.id)) { _, _ in store.reconcileSelection() }
     }
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let albumCounts = store.photos.reduce(into: [String: Int]()) { $0[$1.albumID, default: 0] += 1 }
+        return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
                 Image(systemName: "square.stack.3d.up.fill").font(.title2).foregroundStyle(accent)
                 VStack(alignment: .leading, spacing: 3) { Text("拾影").font(.title2.weight(.semibold)); Text("Photo Harbor").font(.caption).foregroundStyle(.secondary) }
@@ -100,21 +104,23 @@ struct LibraryView: View {
             }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 24).padding(.top, 30).padding(.bottom, 10)
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(spacing: 3) {
+                    LazyVStack(spacing: 3) {
                         ForEach(store.albums) { album in
+                            let paths = [album.roots.jpg, album.roots.raw].filter { !$0.isEmpty }
+                            let urls = paths.map { URL(fileURLWithPath: $0, isDirectory: true) }
                             Button {
                                 store.album = album.id; store.filter = "全部照片"
                             } label: {
-                                HStack(alignment: .top, spacing: 9) { Image(systemName: store.unavailable.contains(album.id) ? "externaldrive.badge.exclamationmark" : "folder").foregroundStyle(accent); Text(album.title).lineLimit(2); Spacer(minLength: 0); Text("\(store.photos.filter { $0.albumID == album.id }.count)").font(.caption2).foregroundStyle(.secondary) }
+                                HStack(alignment: .top, spacing: 9) { Image(systemName: store.unavailable.contains(album.id) ? "externaldrive.badge.exclamationmark" : "folder").foregroundStyle(accent); Text(album.title).lineLimit(2); Spacer(minLength: 0); Text("\(albumCounts[album.id, default: 0])").font(.caption2).foregroundStyle(.secondary) }
                                     .font(.system(size: 12)).padding(.horizontal, 12).padding(.vertical, 9)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .background(store.album == album.id ? accent.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 6))
                                     .contentShape(Rectangle())
                             }.buttonStyle(.plain).disabled(store.busy && !store.scanningAlbums)
                                 .id(album.id)
-                                .help(album.roots.urls.map(\.path).joined(separator: "\n"))
+                                .help(paths.joined(separator: "\n"))
                                 .overlay {
-                                    AlbumContextMenu(roots: album.roots.urls, canClose: !store.busy && !store.editorActive) {
+                                    AlbumContextMenu(roots: urls, canClose: !store.busy && !store.editorActive) {
                                         store.closeAlbum(album.id)
                                     }
                                 }
@@ -211,7 +217,7 @@ struct LibraryView: View {
         VStack(alignment: .leading, spacing: 18) {
             Text("照片信息").font(.system(size: 13, weight: .semibold))
             if let photo = store.focused {
-                PhotoImage(url: photo.preview).frame(height: 144).clipShape(RoundedRectangle(cornerRadius: 5))
+                PhotoImage(file: photo.previewFile).frame(height: 144).clipShape(RoundedRectangle(cornerRadius: 5))
                 VStack(alignment: .leading, spacing: 6) {
                     Text(photo.name).font(.title3.weight(.semibold)).textSelection(.enabled)
                     Text(photo.album).font(.caption).foregroundStyle(.secondary)
@@ -262,7 +268,7 @@ struct PhotoCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             ZStack(alignment: .topTrailing) {
-                PhotoImage(url: photo.preview).aspectRatio(1.4, contentMode: .fit)
+                PhotoImage(file: photo.previewFile, priority: .high).aspectRatio(1.4, contentMode: .fit)
                 VStack(alignment: .trailing, spacing: 5) {
                     if store.state.rejected.contains(photo.id) { Image(systemName: "trash.fill").font(.caption).padding(8).background(.red.opacity(0.85), in: Circle()) }
                     if let score = store.assessments[photo.id]?.aesthetics {
@@ -308,18 +314,46 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @ViewState private var roots = Roots()
     @ViewState private var title = ""
+    @ViewState private var splitOverride: Bool?
+    @ViewState private var opening = false
     @ViewState private var problem: String?
+    private var splitFolders: Bool {
+        splitOverride ?? [roots.jpg, roots.raw].contains { path in
+            ["JPG", "RAW"].contains((path as NSString).lastPathComponent.uppercased())
+        }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             Text("打开相册").font(.title2.weight(.semibold))
             Text("在原目录配对和浏览，不移动、不复制、不重新分类。新相册会追加到左侧列表。").foregroundStyle(.secondary)
-            TextField("相册名称（可选）", text: $title).textFieldStyle(.roundedBorder)
-            folderRow("JPG 目录（可选）", path: $roots.jpg)
-            folderRow("RAW 目录（可选）", path: $roots.raw)
+            Group {
+                folderRow("JPG 目录（可选）", path: $roots.jpg)
+                folderRow("RAW 目录（可选）", path: $roots.raw)
+                Toggle("按子目录打开相册", isOn: Binding(get: { splitFolders }, set: { splitOverride = $0 }))
+                if splitFolders {
+                    Text("JPG 和 RAW 下同名的一级子目录合为一个相册，只有一种格式的子目录也可以打开。").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    TextField("相册名称（可选）", text: $title).textFieldStyle(.roundedBorder)
+                }
+            }.disabled(opening)
             Text("至少填写一个目录。相同的相对路径和文件名优先配对；其余仅在文件名唯一时配对。").font(.caption).foregroundStyle(.secondary)
             if let problem { Text(problem).foregroundStyle(.orange).font(.caption) }
-            HStack { Spacer(); Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("打开并扫描") { do { try store.applyRoots(roots, title: title) } catch { problem = error.localizedDescription } }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(roots.urls.isEmpty)
+            HStack {
+                if opening { ProgressView("正在查找子目录…").controlSize(.small) }
+                Spacer()
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).disabled(opening)
+                Button("打开并扫描") {
+                    opening = true
+                    problem = nil
+                    Task {
+                        defer { opening = false }
+                        do {
+                            if splitFolders { try await store.applyAlbumFolders(roots) }
+                            else { try store.applyRoots(roots, title: title) }
+                        } catch { problem = error.localizedDescription }
+                    }
+                }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    .disabled(opening || store.busy || (roots.jpg.isEmpty && roots.raw.isEmpty))
             }
         }.padding(28).frame(width: 590)
     }

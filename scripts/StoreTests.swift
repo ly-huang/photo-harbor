@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 @main struct StoreTests {
     @MainActor static func wait(_ store: LibraryStore) async throws {
@@ -18,6 +19,31 @@ import Foundation
             try Data("fixture".utf8).write(to: url)
             return url
         }
+        let thumbnailURL = try file("thumbnail/sample.JPG")
+        let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2, bitsPerSample: 8,
+                                      samplesPerPixel: 3, hasAlpha: false, isPlanar: false, colorSpaceName: .deviceRGB,
+                                      bytesPerRow: 0, bitsPerPixel: 0)!
+        for x in 0..<2 { for y in 0..<2 { bitmap.setColor(.red, atX: x, y: y) } }
+        try bitmap.representation(using: .jpeg, properties: [:])!.write(to: thumbnailURL)
+        let thumbnail = try LibraryService.scanFiles(thumbnailURL.deletingLastPathComponent(), extensions: ["jpg"])[0]
+        let thumbnails = ImageCache()
+        thumbnails.queue.isSuspended = true
+        let oldRequest = Task { await thumbnails.load(thumbnail, size: 32, priority: .high) }
+        for _ in 0..<100 {
+            if thumbnails.queue.operationCount > 0 { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        precondition(thumbnails.queue.operationCount == 1)
+        oldRequest.cancel()
+        thumbnails.queue.isSuspended = false
+        let cancelledImage = await oldRequest.value
+        precondition(cancelledImage == nil && thumbnails.cache.object(forKey: "\(thumbnail.url.path):32:\(thumbnail.identity):\(thumbnail.bytes):\(thumbnail.modified.timeIntervalSince1970)" as NSString) == nil)
+        let currentImage = await thumbnails.load(thumbnail, size: 32, priority: .high)
+        precondition(currentImage != nil)
+        try FileManager.default.removeItem(at: thumbnailURL)
+        let reusedImage = await thumbnails.load(thumbnail, size: 32, priority: .high)
+        precondition(reusedImage === currentImage)
+        print("PASS thumbnail queue skips cancelled pending requests and reuses completed images")
         let a = try file("first/A.JPG"); let b = try file("second/B.ARW")
         let store = LibraryStore(stateURL: base.appendingPathComponent("state.json"))
         try store.applyRoots(Roots(jpg: a.deletingLastPathComponent().path), title: "第一本")
@@ -37,6 +63,36 @@ import Foundation
         precondition(!reopened.busy)
         try FileManager.default.removeItem(at: addedWhileOpen)
         print("PASS append independent JPG-only and RAW-only albums")
+        _ = try file("archive/JPG/20241115_未知/A.JPG")
+        _ = try file("archive/RAW/20241115_未知/A.ARW")
+        _ = try file("archive/JPG/20241116_未知/A.JPG")
+        _ = try file("archive/RAW/20241117_未知/A.ARW")
+        let archive = Roots(jpg: base.appendingPathComponent("archive/JPG").path,
+                            raw: base.appendingPathComponent("archive/RAW").path)
+        let groupedStore = LibraryStore(stateURL: base.appendingPathComponent("grouped-state.json"))
+        try groupedStore.applyRoots(archive)
+        try await wait(groupedStore)
+        let aggregate = groupedStore.albums[0]
+        do {
+            try await groupedStore.applyAlbumFolders(archive)
+            preconditionFailure("An open parent must prevent duplicate registration")
+        } catch is LibraryError {}
+        precondition(groupedStore.albums == [aggregate])
+        groupedStore.closeAlbum(aggregate.id)
+        try await groupedStore.applyAlbumFolders(archive)
+        try await wait(groupedStore)
+        precondition(groupedStore.albums.map(\.title) == ["20241115_未知", "20241116_未知", "20241117_未知"])
+        precondition(groupedStore.photos.count == 3 && groupedStore.photos.filter(\.paired).count == 1)
+        let rawOnly = groupedStore.photos.first { $0.files.count == 1 && $0.files[0].isRAW }
+        precondition(rawOnly?.preview.pathExtension == "ARW" && rawOnly?.paired == false)
+        let serialArchive = try LibraryService.scan(archive)
+        let parallelArchive = try await LibraryService.scanForBrowsing(archive, parallelFormats: true)
+        precondition(parallelArchive.map(\.id) == serialArchive.map(\.id))
+        let albumIDs = groupedStore.albums.map(\.id)
+        try await groupedStore.applyAlbumFolders(archive)
+        try await wait(groupedStore)
+        precondition(groupedStore.albums.map(\.id) == albumIDs)
+        print("PASS opening archive folders pairs within named subfolders and prevents overlapping or duplicate albums")
         let compareA = store.photos[0], compareB = store.photos[1]
         store.toggleComparison(compareA); store.toggleComparison(compareB)
         precondition(store.comparisonPhotos.count == 2)

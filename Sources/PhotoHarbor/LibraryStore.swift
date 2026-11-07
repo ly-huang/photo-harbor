@@ -122,62 +122,45 @@ import AppKit
         }
     }
     private func reloadAlbums(only albumIDs: Set<String>? = nil, publishIncrementally: Bool = false) async {
-        var results: [Photo] = []
-        var failed: Set<String> = []
-        var marks: [String: PhotoAnnotation] = [:]
-        var markErrors = 0
-        let previousPhotos = Dictionary(grouping: photos, by: \.albumID)
-        let previousMarks = annotations
-        let previousUnavailable = unavailable
-        let legacy = state.rejected
         let albumsToLoad = state.albums
-        let scanCount = albumsToLoad.filter { albumIDs?.contains($0.id) ?? true }.count
+        let legacy = state.rejected
+        var targets = albumsToLoad.filter { albumIDs?.contains($0.id) ?? true }
+        if let album, let index = targets.firstIndex(where: { $0.id == album }), index > 0 {
+            targets.insert(targets.remove(at: index), at: 0)
+        }
+        var byAlbum = Dictionary(grouping: photos, by: \.albumID)
+        var failed = unavailable
+        var marks = annotations
+        var markErrors = 0
         var scannedCount = 0
-        for item in albumsToLoad {
-            if let albumIDs, !albumIDs.contains(item.id) {
-                let cached = previousPhotos[item.id] ?? []
-                results += cached
-                for photo in cached { marks[photo.id] = previousMarks[photo.id] }
-                if previousUnavailable.contains(item.id) { failed.insert(item.id) }
-                continue
+        let scanCount = targets.count
+        let parallelFormats = scanCount == 1
+        await withTaskGroup(of: AlbumScan.self) { group in
+            var pending = targets.makeIterator()
+            for _ in 0..<min(3, scanCount) {
+                guard let item = pending.next() else { break }
+                group.addTask(priority: .userInitiated) { await Self.readAlbum(item, legacy: legacy, parallelFormats: parallelFormats) }
             }
-            do {
-                let loaded = try await Task.detached(priority: .userInitiated) {
-                    var scanned = try LibraryService.scan(item.roots)
-                    var index = PhotoMarkStorage.DirectoryIndex()
-                    var annotations: [String: PhotoAnnotation] = [:]
-                    var errors = 0
-                    for i in scanned.indices {
-                        scanned[i].albumID = item.id
-                        let photo = scanned[i]
-                        let id = photo.id
-                        do {
-                            annotations[id] = try index.load(photo, legacyRejected: legacy.contains(id))
-                        } catch {
-                            errors += 1
-                            let existing = photo.files.contains { FileManager.default.fileExists(atPath: PhotoMarkStorage.url($0).path) }
-                            annotations[id] = PhotoAnnotation(rejected: !existing && legacy.contains(id))
-                        }
-                    }
-                    return (scanned, annotations, errors)
-                }.value
-                results += loaded.0
-                marks.merge(loaded.1) { _, fresh in fresh }
-                markErrors += loaded.2
-            } catch { failed.insert(item.id) }
-            if publishIncrementally {
-                scannedCount += 1
-                // Keep untouched albums available while a newly opened album is scanned.
-                if albumIDs == nil {
-                    annotations = marks
-                    photos = results
-                    unavailable = failed
-                    state.rejected = Set(marks.compactMap { $0.value.rejected ? $0.key : nil })
-                    reconcileSelection()
+            for await result in group {
+                for photo in byAlbum[result.id] ?? [] { marks.removeValue(forKey: photo.id) }
+                byAlbum[result.id] = result.photos
+                marks.merge(result.marks) { _, fresh in fresh }
+                markErrors += result.markErrors
+                if result.failed { failed.insert(result.id) } else { failed.remove(result.id) }
+                if let item = pending.next() {
+                    group.addTask(priority: .userInitiated) { await Self.readAlbum(item, legacy: legacy, parallelFormats: parallelFormats) }
                 }
-                status = "已扫描 \(scannedCount)/\(scanCount) 个相册，已找到 \(results.count) 张照片…"
+                if publishIncrementally {
+                    scannedCount += 1
+                    annotations = marks
+                    photos = albumsToLoad.flatMap { byAlbum[$0.id] ?? [] }
+                    unavailable = failed
+                    reconcileSelection()
+                    status = "已扫描 \(scannedCount)/\(scanCount) 个相册，已找到 \(photos.count) 张照片…"
+                }
             }
         }
+        let results = albumsToLoad.flatMap { byAlbum[$0.id] ?? [] }
         annotations = marks
         state.rejected = Set(marks.compactMap { $0.value.rejected ? $0.key : nil })
         if markErrors > 0 { error = "\(markErrors) 张照片的目录标记未能读取或迁移，请检查权限及隐藏记录；未对这些照片启用删除标记。" }
@@ -192,6 +175,38 @@ import AppKit
         reconcileSelection(); save()
         status = "\(photos.count) 张照片，\(photos.filter(\.paired).count) 对 JPG + RAW" + (failed.isEmpty ? "" : "；\(failed.count) 个相册无法访问，已清除其撤销记录")
     }
+    private struct AlbumScan: Sendable {
+        let id: String
+        var photos: [Photo] = []
+        var marks: [String: PhotoAnnotation] = [:]
+        var markErrors = 0
+        var failed = false
+    }
+
+    nonisolated private static func readAlbum(_ album: OpenAlbum, legacy: Set<String>, parallelFormats: Bool) async -> AlbumScan {
+        var result = AlbumScan(id: album.id)
+        do {
+            result.photos = try await LibraryService.scanForBrowsing(album.roots, parallelFormats: parallelFormats)
+        } catch {
+            result.failed = true
+            return result
+        }
+        var index = PhotoMarkStorage.DirectoryIndex()
+        for i in result.photos.indices {
+            result.photos[i].albumID = album.id
+            let photo = result.photos[i]
+            let id = photo.id
+            do {
+                result.marks[id] = try index.load(photo, legacyRejected: legacy.contains(id))
+            } catch {
+                result.markErrors += 1
+                let existing = photo.files.contains { FileManager.default.fileExists(atPath: PhotoMarkStorage.url($0).path) }
+                result.marks[id] = PhotoAnnotation(rejected: !existing && legacy.contains(id))
+            }
+        }
+        return result
+    }
+
     func reloadAfterEditing(_ url: URL) async {
         busy = true
         let oldPhoto=photos.first{$0.files.contains{$0.url==url}}
@@ -245,27 +260,66 @@ import AppKit
     }
     @discardableResult private func registerAlbum(_ roots: Roots, title: String? = nil) throws -> String {
         try roots.validate()
-        let normalized = OpenAlbum(roots: roots, title: title)
-        if let existing = state.albums.first(where: { $0.roots == normalized.roots }) { return existing.id }
-        // An existing open ancestor already owns these files. Never list a file twice.
-        if let owner = state.albums.first(where: { existing in
-            roots.urls.allSatisfy { child in existing.roots.urls.contains { child.path == $0.path || child.path.hasPrefix($0.path + "/") } }
-        }) { return owner.id }
-        for existing in state.albums {
-            if existing.roots.urls.contains(where: { a in roots.urls.contains { b in a.path == b.path || a.path.hasPrefix(b.path + "/") || b.path.hasPrefix(a.path + "/") } }) {
-                throw LibraryError.message("这些目录与已打开的“\(existing.title)”重叠。请先关闭该相册，避免重复管理同一文件。")
-            }
-        }
-        state.albums.append(normalized)
-        return normalized.id
+        let incoming = OpenAlbum(roots: roots, title: title)
+        let (albums, ids) = try Self.registerAlbums([incoming], into: state.albums)
+        state.albums = albums
+        return ids[0]
     }
+
+    nonisolated private static func registerAlbums(_ incoming: [OpenAlbum], into existing: [OpenAlbum], allowAncestor: Bool = true) throws -> ([OpenAlbum], [String]) {
+        var albums = existing
+        var paths = existing.map { $0.roots.urls.map(\.path) }
+        var ids: [String] = []
+        for item in incoming {
+            let children = item.roots.urls.map(\.path)
+            if let owner = albums.indices.first(where: { index in
+                albums[index].roots == item.roots || children.allSatisfy { child in
+                    paths[index].contains { child == $0 || child.hasPrefix($0 + "/") }
+                }
+            }) {
+                guard allowAncestor || albums[owner].roots == item.roots else {
+                    throw LibraryError.message("子目录已由「\(albums[owner].title)」管理。请先关闭该上层相册，再按子目录打开。")
+                }
+                ids.append(albums[owner].id)
+                continue
+            }
+            if let overlap = paths.firstIndex(where: { roots in
+                roots.contains { a in children.contains { b in a == b || a.hasPrefix(b + "/") || b.hasPrefix(a + "/") } }
+            }) {
+                throw LibraryError.message("这些目录与已打开的“\(albums[overlap].title)”重叠。请先关闭该相册，避免重复管理同一文件。")
+            }
+            albums.append(item)
+            paths.append(children)
+            ids.append(item.id)
+        }
+        return (albums, ids)
+    }
+
     func applyRoots(_ roots: Roots, title: String = "") throws {
+        try roots.validate()
+        let (albums, ids) = try Self.registerAlbums([OpenAlbum(roots: roots, title: title)], into: state.albums)
+        try finishOpening(albums, ids: ids)
+    }
+
+    func applyAlbumFolders(_ roots: Roots) async throws {
+        guard !busy else { throw LibraryError.message("照片库正在处理其他任务，请稍后重试。") }
+        let existing = state.albums
+        let (albums, ids) = try await Task.detached {
+            let incoming = try LibraryService.discoverAlbumFolders(roots)
+            return try Self.registerAlbums(incoming, into: existing, allowAncestor: false)
+        }.value
+        guard !busy, state.albums == existing else { throw LibraryError.message("相册列表已变化，请重新打开。") }
+        try finishOpening(albums, ids: ids)
+    }
+
+    private func finishOpening(_ albums: [OpenAlbum], ids: [String]) throws {
         let previous = state
-        do {
-            album = try registerAlbum(roots, title: title)
-            try persist()
-        } catch { state = previous; throw error }
-        filter = "全部照片"; search = ""; settings = false; scan(only: album.map { [$0] })
+        state.albums = albums
+        do { try persist() } catch { state = previous; throw error }
+        album = ids.first
+        filter = "全部照片"; search = ""; settings = false
+        scan(only: Set(ids))
+        if ids.count > 1 { importedAlbumReveal = UUID() }
     }
     func closeAlbum(_ id: String) {
         closeAlbums([id], all: false)

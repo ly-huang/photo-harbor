@@ -24,7 +24,7 @@ struct ComparisonSelectionPopover: View {
                     LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
                         ForEach(Array(photos.enumerated()), id: \.element.id) { index, photo in
                             VStack(alignment: .leading, spacing: 5) {
-                                PhotoImage(url: photo.preview, size: 360).frame(height: 94)
+                                PhotoImage(file: photo.previewFile, size: 360).frame(height: 94)
                                     .clipShape(RoundedRectangle(cornerRadius: 7))
                                     .overlay(alignment: .topTrailing) {
                                         Button { store.toggleComparison(photo) } label: {

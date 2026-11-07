@@ -30,6 +30,42 @@ struct LibraryService {
         try roots.validate()
         return pair(jpg: try roots.jpgURL.map { try scanFiles($0, extensions: ["jpg", "jpeg"]) } ?? [], raw: try roots.rawURL.map { try scanFiles($0, extensions: ["arw"]) } ?? [])
     }
+    static func scanForBrowsing(_ roots: Roots, parallelFormats: Bool) async throws -> [Photo] {
+        guard parallelFormats, !roots.jpg.isEmpty, !roots.raw.isEmpty else { return try scan(roots) }
+        try roots.validate()
+        async let jpg = roots.jpgURL.map { try scanFiles($0, extensions: ["jpg", "jpeg"]) } ?? []
+        async let raw = roots.rawURL.map { try scanFiles($0, extensions: ["arw"]) } ?? []
+        return try await pair(jpg: jpg, raw: raw)
+    }
+    static func discoverAlbumFolders(_ roots: Roots) throws -> [OpenAlbum] {
+        try roots.validate()
+        func children(_ root: URL?, extensions: Set<String>) throws -> ([String: URL], Bool) {
+            guard let root else { return ([:], false) }
+            let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+            var folders: [String: URL] = [:]
+            var hasLoosePhotos = false
+            for entry in try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: Array(keys), options: .skipsHiddenFiles) {
+                let values = try entry.resourceValues(forKeys: keys)
+                guard values.isSymbolicLink != true else { continue }
+                if values.isDirectory == true {
+                    folders[entry.lastPathComponent] = entry
+                } else if values.isRegularFile == true, extensions.contains(entry.pathExtension.lowercased()) {
+                    hasLoosePhotos = true
+                }
+            }
+            return (folders, hasLoosePhotos)
+        }
+        let (jpg, looseJPG) = try children(roots.jpgURL, extensions: ["jpg", "jpeg"])
+        let (raw, looseRAW) = try children(roots.rawURL, extensions: ["arw"])
+        let names = Set(jpg.keys).union(raw.keys).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        guard !names.isEmpty else { return [OpenAlbum(roots: roots)] }
+        guard !looseJPG, !looseRAW else {
+            throw LibraryError.message("所选目录同时包含直属照片和子目录。请关闭「按子目录打开相册」以浏览全部照片，或单独选择要打开的子目录。")
+        }
+        return names.map { name in
+            OpenAlbum(roots: Roots(jpg: jpg[name]?.path ?? "", raw: raw[name]?.path ?? ""), title: name)
+        }
+    }
     static func pair(jpg: [PhotoFile], raw: [PhotoFile]) -> [Photo] {
         let jRelative = Dictionary(grouping: jpg, by: \.relativeStem)
         let rRelative = Dictionary(grouping: raw, by: \.relativeStem)

@@ -7,7 +7,7 @@ if [[ "${1:-}" == '--release' ]]; then configuration=release; fi
 if [[ "$configuration" != debug && "$configuration" != release ]]; then print -u2 'Build configuration must be debug or release'; exit 1; fi
 mkdir -p .build dist.noindex
 zsh scripts/compile-app.sh "$configuration"
-binary_dir="$PWD/.build/incremental/$configuration"
+binary_dir="$PWD/.build/app-binary/$configuration"
 staging_root=$(mktemp -d "$PWD/.build/app-stage.XXXXXX")
 cleanup_build() { rm -rf "$staging_root"; }
 trap cleanup_build EXIT
@@ -44,8 +44,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>AppIconPearlWhiteSized</string>
 <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-<key>CFBundleShortVersionString</key><string>1.1.5</string>
-<key>CFBundleVersion</key><string>33</string>
+<key>CFBundleShortVersionString</key><string>1.1.6</string>
+<key>CFBundleVersion</key><string>34</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>

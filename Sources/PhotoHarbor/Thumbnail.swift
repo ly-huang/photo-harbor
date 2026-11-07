@@ -6,26 +6,43 @@ final class ImageCache: @unchecked Sendable {
     let cache = NSCache<NSString, NSImage>()
     let queue = OperationQueue()
     init() { cache.totalCostLimit = 512 * 1024 * 1024; queue.maxConcurrentOperationCount = 3 }
-    func load(_ url: URL, size: Int) async -> NSImage? {
-        let stamp = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?.timeIntervalSince1970 ?? 0
-        let key = "\(url.path):\(size):\(stamp)"
+    private final class DecodeResult: @unchecked Sendable {
+        // The operation writes this before its completion block reads it.
+        var image: NSImage?
+    }
+
+    func load(_ file: PhotoFile, size: Int, priority: Operation.QueuePriority = .normal) async -> NSImage? {
+        guard !Task.isCancelled else { return nil }
+        let url = file.url
+        let key = "\(url.path):\(size):\(file.identity):\(file.bytes):\(file.modified.timeIntervalSince1970)"
         if let cached = cache.object(forKey: key as NSString) { return cached }
-        return await withCheckedContinuation { continuation in
-            queue.addOperation {
-                let result: NSImage? = autoreleasepool {
-                    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: size] as CFDictionary) else { return nil }
-                    let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-                    self.cache.setObject(image, forKey: key as NSString, cost: cg.bytesPerRow * cg.height)
-                    return image
-                }
-                continuation.resume(returning: result)
+        let operation = BlockOperation()
+        operation.queuePriority = priority
+        let result = DecodeResult()
+        operation.addExecutionBlock { [weak operation] in
+            guard operation?.isCancelled == false else { return }
+            result.image = autoreleasepool {
+                if let cached = self.cache.object(forKey: key as NSString) { return cached }
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: size] as CFDictionary) else { return nil }
+                let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                self.cache.setObject(image, forKey: key as NSString, cost: cg.bytesPerRow * cg.height)
+                return image
             }
+        }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                operation.completionBlock = { continuation.resume(returning: result.image) }
+                queue.addOperation(operation)
+            }
+        } onCancel: {
+            operation.cancel()
         }
     }
 }
 struct PhotoImage: View {
-    let url: URL
+    let file: PhotoFile
     var size = 600
+    var priority: Operation.QueuePriority = .normal
     @ViewState private var image: NSImage?
     @ViewState private var loading = true
     var body: some View {
@@ -38,12 +55,12 @@ struct PhotoImage: View {
                 else { VStack(spacing: 8) { Image(systemName: "photo.badge.exclamationmark"); Text("无法预览 · 可在 Finder 查看").font(.caption) }.foregroundStyle(.secondary) }
             }
         }
-        .task(id: "\(url.path)-\(size)-\((try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?.timeIntervalSince1970 ?? 0)") {
+        .task(id: "\(file.url.path):\(size):\(file.identity):\(file.bytes):\(file.modified.timeIntervalSince1970)") {
             image = nil; loading = true
-            let loaded = await ImageCache.shared.load(url, size: size)
+            let loaded = await ImageCache.shared.load(file, size: size, priority: priority)
             guard !Task.isCancelled else { return }
             image = loaded; loading = false
         }
-        .accessibilityLabel(url.lastPathComponent)
+        .accessibilityLabel(file.url.lastPathComponent)
     }
 }
