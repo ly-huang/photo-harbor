@@ -12,6 +12,7 @@ struct LibraryView: View {
     @ViewState private var exportPhotos: [Photo] = []
     @ViewState private var showingExport = false
     @ViewState private var confirmCloseAll = false
+    @ViewState private var confirmDirectDelete = false
     var body: some View {
         HStack(spacing: 0) {
             sidebar.frame(width: 208)
@@ -33,8 +34,8 @@ struct LibraryView: View {
                     if store.busy { ProgressView().controlSize(.small) }
                     Text(store.status).lineLimit(1).help(store.status)
                     Spacer()
-                    if store.busy && store.progress > 0 {
-                        ProgressView(value: store.progress).frame(width: 80)
+                    if let progress = store.importProgress {
+                        ProgressView(value: progress).frame(width: 80)
                         Button("停止导入") { store.cancellationRequested = true }.buttonStyle(.borderless)
                     }
                     Image(systemName: "internaldrive"); Text("本地照片库")
@@ -57,6 +58,12 @@ struct LibraryView: View {
             Button("移入废纸篓", role: .destructive) { store.deleteRejected() }
         } message: {
             Text("共 \(store.rejected.reduce(0) { $0 + $1.files.count }) 个 JPG / ARW 文件，\(readableBytes(store.rejected.reduce(0) { $0 + $1.bytes }))。操作前会再次核对配对关系；有歧义的照片不会删除。")
+        }
+        .alert("直接删除 \(store.rejected.count) 张照片？", isPresented: $confirmDirectDelete) {
+            Button("取消", role: .cancel) {}
+            Button("直接删除", role: .destructive) { store.deleteRejected(permanently: true) }
+        } message: {
+            Text("将删除共 \(store.rejected.reduce(0) { $0 + $1.files.count }) 个 JPG / ARW 文件，包含配对文件。此操作绕过系统废纸篓，无法通过拾影撤销。")
         }
         .alert("关闭所有相册？", isPresented: $confirmCloseAll) {
             Button("取消", role: .cancel) {}
@@ -149,8 +156,10 @@ struct LibraryView: View {
                             .environmentObject(store)
                     }
                 if store.filter == "待删除" {
-                    Button("移入废纸篓", role: .destructive) { store.confirmTrash = true }
-                        .disabled(store.busy || !store.trusted || store.rejected.isEmpty)
+                    Menu("删除操作") {
+                        Button("移入废纸篓") { store.confirmTrash = true }
+                        Button("直接删除…", role: .destructive) { confirmDirectDelete = true }
+                    }.disabled(store.busy || !store.trusted || store.rejected.isEmpty)
                 }
             }
             HStack {

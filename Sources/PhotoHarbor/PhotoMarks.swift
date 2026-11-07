@@ -19,11 +19,9 @@ struct PhotoMarkRecord:Codable,Sendable {
 enum PhotoMarkStorage {
     static func directory(_ file:PhotoFile)->URL{file.url.deletingLastPathComponent().appendingPathComponent(".photoharbor-marks",isDirectory:true)}
     static func url(_ file:PhotoFile)->URL{directory(file).appendingPathComponent(EditPersistence.hash(Data(file.url.lastPathComponent.utf8))+".json")}
-    private static func checkFile(_ file:PhotoFile)throws {
+    private static func checkFile(_ file: PhotoFile) throws {
         try EditPersistence.rejectLinks(file.url)
-        let a=try FileManager.default.attributesOfItem(atPath:file.url.path)
-        let identity="\(a[.systemNumber] ?? ""):\(a[.systemFileNumber] ?? ""):\(a[.creationDate] ?? "")"
-        guard a[.type] as? FileAttributeType == .typeRegular,identity==file.identity,(a[.size] as? NSNumber)?.int64Value==file.bytes,a[.modificationDate] as? Date==file.modified else{throw LibraryError.message("照片已变化，请重新扫描后再设置标记。")}
+        try LibraryService.validateFileIdentity(file)
     }
     private static func read(_ file:PhotoFile)throws->PhotoMarkRecord? {
         let target=url(file)

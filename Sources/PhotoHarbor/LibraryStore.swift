@@ -37,7 +37,7 @@ import AppKit
     @Published var confirmTrash = false
     @Published var history = false
     @Published var metadata = Metadata()
-    @Published var progress: Double = 0
+    @Published private(set) var importProgress: Double?
     @Published var cancellationRequested = false
     var viewerController: PhotoViewerController?
     var comparisonController: ComparisonController?
@@ -330,7 +330,7 @@ import AppKit
     func executeImport(_ plan: [ImportItem], roots: Roots) {
         guard !busy, !plan.isEmpty else { return }
         let roots = Roots.importDestinations(jpg: roots.jpg, raw: roots.raw)
-        busy = true; progress = 0; cancellationRequested = false
+        busy = true; importProgress = 0; cancellationRequested = false
         Task {
             var completed: [ImportItem] = []
             var outcome = ""
@@ -354,7 +354,7 @@ import AppKit
                     }
                     try await Task.detached(priority: .userInitiated) { try LibraryService.publishVerifiedImport(prepared) }.value
                     completed.append(item)
-                    progress = Double(completed.count) / Double(plan.count)
+                    importProgress = Double(completed.count) / Double(plan.count)
                 }
                 outcome = "已复制并校验 \(completed.count)/\(plan.count) 个文件。源文件保留。"
             } catch { self.error = "已完成 \(completed.count) 个文件；导入停止：\(error.localizedDescription)"; outcome = "导入已停止，已完成 \(completed.count)/\(plan.count) 个文件。" }
@@ -362,6 +362,8 @@ import AppKit
                 pending.cancel()
                 if let prepared = try? await pending.value { prepared.discard() }
             }
+            importProgress = nil
+            cancellationRequested = false
             let groups = Dictionary(grouping: completed, by: { $0.destination.deletingLastPathComponent().lastPathComponent })
             var openedAlbumIDs: [String] = []
             var seenAlbumIDs = Set<String>()
@@ -392,12 +394,17 @@ import AppKit
             if !openedAlbumIDs.isEmpty { importedAlbumReveal = UUID() }
         }
     }
-    func deleteRejected() {
+    func deleteRejected(permanently: Bool = false, moveToTrash: @escaping @Sendable (PhotoFile) throws -> TrashRecord = { try LibraryService.trash($0) }) {
         guard trusted, !busy, !rejected.isEmpty else { return }
         let targets = rejected
+        let action = permanently ? "直接删除" : "移入废纸篓"
         busy = true
+        status = "正在核对待删除照片及配对关系…"
         Task {
+            defer { busy = false }
             var count = 0
+            var changedAlbums: Set<String> = []
+            var failure: String?
             do {
                 // Validate every affected album before deleting the first file.
                 for group in Dictionary(grouping: targets, by: \.albumID) {
@@ -408,7 +415,28 @@ import AppKit
                 var batchIDs: [String: String] = [:]
                 for photo in targets {
                     for file in photo.files {
-                        let record = try await Task.detached { try LibraryService.trash(file) }.value
+                        status = "正在\(action)：\(file.url.lastPathComponent)…"
+                        let record = try await Task.detached { () -> TrashRecord? in
+                            do {
+                                if permanently {
+                                    try LibraryService.deletePermanently(file)
+                                    return nil
+                                }
+                                return try moveToTrash(file)
+                            }
+                            catch {
+                                if permanently {
+                                    throw LibraryError.message("无法直接删除「\(file.url.lastPathComponent)」。\(error.localizedDescription)")
+                                }
+                                throw LibraryError.message("无法将「\(file.url.lastPathComponent)」移入系统废纸篓。\(error.localizedDescription) 如果照片位于 NAS，请确认共享支持 macOS 废纸篓且具有移动权限。")
+                            }
+                        }.value
+                        count += 1
+                        changedAlbums.insert(photo.albumID)
+                        guard let record else {
+                            try await Task.detached { try PhotoMarkStorage.consumeRejection(file) }.value
+                            continue
+                        }
                         let index: Int
                         if let batchID = batchIDs[photo.albumID], let found = state.deletionBatches.firstIndex(where: { $0.id == batchID }) { index = found }
                         else {
@@ -417,15 +445,23 @@ import AppKit
                             index = state.deletionBatches.count - 1
                         }
                         state.deletionBatches[index].records.append(record)
-                        try persist(); count += 1
+                        try persist()
                         try await Task.detached{try PhotoMarkStorage.consumeRejection(file)}.value
                     }
                     state.rejected.remove(photo.id); try persist()
                 }
-            } catch { self.error = "已移入废纸篓 \(count) 个文件：\(error.localizedDescription)。已完成部分可按批次撤销。" }
-            await reloadAlbums()
-            status = "已将 \(count) 个文件移入废纸篓，按相册和操作批次记录。"
-            busy = false
+            } catch { failure = error.localizedDescription }
+            if !changedAlbums.isEmpty {
+                status = "正在更新受影响的相册…"
+                await reloadAlbums(only: changedAlbums)
+            }
+            if let failure {
+                let result = permanently ? "已直接删除 \(count) 个文件，无法通过拾影撤销。" : "已移动 \(count) 个文件，可按批次撤销。"
+                status = count == 0 ? "未能\(action)，待删除标记已保留。" : "\(action)已停止。\(result)"
+                self.error = count == 0 ? failure : "\(failure) \(result)"
+            } else {
+                status = permanently ? "已直接删除 \(count) 个文件。" : "已将 \(count) 个文件移入废纸篓，按相册和操作批次记录。"
+            }
         }
     }
     func dismissBatch(_ id: String) { state.deletionBatches.removeAll { $0.id == id }; save() }

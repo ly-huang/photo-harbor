@@ -65,6 +65,65 @@ import Foundation
         precondition(store.comparisonPhotos.map(\.id) == [compareA.id, compareB.id])
         print("PASS clear comparison selection preserves photos and marks; selection can be rebuilt")
 
+        let untouchedAddition = try file("second/later.ARW")
+        store.album = first.id
+        store.toggleReject(compareA)
+        try await wait(store)
+        store.deleteRejected { _ in throw CocoaError(.fileWriteNoPermission) }
+        try await wait(store)
+        precondition(store.error != nil && store.status.contains("未能"))
+        precondition(store.rejected.map(\.id) == [compareA.id] && store.undoBatches.isEmpty)
+        precondition(FileManager.default.fileExists(atPath: a.path))
+        precondition(!store.photos.contains { $0.preview == untouchedAddition })
+        store.error = nil
+        store.toggleReject(compareA)
+        try await wait(store)
+        try FileManager.default.removeItem(at: untouchedAddition)
+        print("PASS failed trash unlocks controls, retains the mark and does not rescan unrelated albums")
+
+        let pairedJPG = try file("partial/jpg/P.JPG")
+        let pairedRAW = try file("partial/raw/P.ARW")
+        let trashCopy = base.appendingPathComponent("partial/P.JPG")
+        let partialStore = LibraryStore(stateURL: base.appendingPathComponent("partial-state.json"))
+        try partialStore.applyRoots(Roots(jpg: pairedJPG.deletingLastPathComponent().path,
+                                          raw: pairedRAW.deletingLastPathComponent().path))
+        try await wait(partialStore)
+        partialStore.toggleReject(partialStore.photos[0])
+        try await wait(partialStore)
+        let firstMember = partialStore.photos[0].files[0].url
+        partialStore.deleteRejected { member in
+            guard member.url == firstMember else { throw CocoaError(.fileWriteNoPermission) }
+            try FileManager.default.moveItem(at: member.url, to: trashCopy)
+            return TrashRecord(original: member.url, trashed: trashCopy)
+        }
+        try await wait(partialStore)
+        precondition(partialStore.undoBatches.first?.records.count == 1)
+        precondition(partialStore.rejected.count == 1 && partialStore.rejected[0].files.count == 1)
+        partialStore.undoTrash()
+        try await wait(partialStore)
+        precondition(partialStore.photos.count == 1 && partialStore.photos[0].paired)
+        print("PASS partial trash retains the remaining file and restores the moved member")
+
+        partialStore.toggleReject(partialStore.photos[0])
+        try await wait(partialStore)
+        try Data("replacement".utf8).write(to: pairedRAW)
+        partialStore.deleteRejected(permanently: true)
+        try await wait(partialStore)
+        precondition(partialStore.error != nil && partialStore.undoBatches.isEmpty)
+        precondition(FileManager.default.fileExists(atPath: pairedJPG.path))
+        precondition(FileManager.default.fileExists(atPath: pairedRAW.path))
+        partialStore.error = nil
+        partialStore.scan()
+        try await wait(partialStore)
+        partialStore.toggleReject(partialStore.photos[0])
+        try await wait(partialStore)
+        partialStore.deleteRejected(permanently: true)
+        try await wait(partialStore)
+        precondition(partialStore.error == nil && partialStore.undoBatches.isEmpty && partialStore.photos.isEmpty)
+        precondition(!FileManager.default.fileExists(atPath: pairedJPG.path))
+        precondition(!FileManager.default.fileExists(atPath: pairedRAW.path))
+        print("PASS direct deletion checks both members before removing either and creates no undo record")
+
         let one = try file("trash/one.JPG"), two = try file("trash/two.JPG")
         let stale = base.appendingPathComponent("trash/gone.JPG")
         let originalOne = a.deletingLastPathComponent().appendingPathComponent("one.JPG")

@@ -515,6 +515,18 @@ struct LibraryService {
         guard let result else { throw LibraryError.message("系统未返回废纸篓位置：\(file.url.path)") }
         return TrashRecord(original: file.url, trashed: result as URL)
     }
+    static func validateFileIdentity(_ file: PhotoFile) throws {
+        let a=try FileManager.default.attributesOfItem(atPath:file.url.path)
+        let identity="\(a[.systemNumber] ?? ""):\(a[.systemFileNumber] ?? ""):\(a[.creationDate] ?? "")"
+        guard a[.type] as? FileAttributeType == .typeRegular,identity==file.identity,(a[.size] as? NSNumber)?.int64Value==file.bytes,a[.modificationDate] as? Date==file.modified else{throw LibraryError.message("照片已变化，请重新扫描后再设置标记。")}
+    }
+    static func deletePermanently(_ file: PhotoFile) throws {
+        guard canonicalURL(file.url).path == file.url.path else { throw LibraryError.message("照片路径包含符号链接。") }
+        try validateFileIdentity(file)
+        guard unlink(file.url.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
     static func restore(_ record: TrashRecord) throws {
         guard !manager.fileExists(atPath: record.original.path) else { throw LibraryError.message("恢复目标已存在，未覆盖：\(record.original.path)") }
         try manager.createDirectory(at: record.original.deletingLastPathComponent(), withIntermediateDirectories: true)
