@@ -35,9 +35,39 @@ enum PhotoMarkStorage {
         guard record.version==1,record.filename==file.url.lastPathComponent,record.digest.count==64,record.digest.allSatisfy(\.isHexDigit) else{throw LibraryError.message("照片标记记录无效。")}
         return record
     }
-    static func load(_ photo:Photo,legacyRejected:Bool=false)throws->PhotoAnnotation {
+    struct DirectoryIndex {
+        private var names: [URL: Set<String>] = [:]
+        private var unavailable: Set<URL> = []
+
+        mutating func load(_ photo: Photo, legacyRejected: Bool) throws -> PhotoAnnotation {
+            // Legacy migration may create records, so always read directly for those photos.
+            if legacyRejected { return try PhotoMarkStorage.load(photo, legacyRejected: true) }
+            var candidates: Set<URL> = []
+            for file in photo.files {
+                let folder = directory(file)
+                if names[folder] == nil, !unavailable.contains(folder) {
+                    if !FileManager.default.fileExists(atPath: folder.path) {
+                        names[folder] = []
+                    } else {
+                        do {
+                            try EditPersistence.rejectLinks(folder)
+                            let entries = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+                            names[folder] = Set(entries.map { $0.lowercased() })
+                        } catch { unavailable.insert(folder) }
+                    }
+                }
+                let target = url(file)
+                if names[folder]?.contains(target.lastPathComponent.lowercased()) != false {
+                    candidates.insert(file.url)
+                }
+            }
+            return try PhotoMarkStorage.load(photo, candidates: candidates)
+        }
+    }
+    static func load(_ photo:Photo,legacyRejected:Bool=false, candidates: Set<URL>? = nil)throws->PhotoAnnotation {
         var records:[PhotoMarkRecord]=[],mismatch=false,found=false
         for file in photo.files {
+            if let candidates, !candidates.contains(file.url) { continue }
             guard let record=try read(file) else{continue};found=true
             guard record.bytes==file.bytes else{mismatch=true;continue}
             try checkFile(file);let digest=try EditPersistence.hash(file.url);try checkFile(file)

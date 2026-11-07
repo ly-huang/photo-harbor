@@ -11,6 +11,7 @@ struct LibraryView: View {
     @ViewState private var showingSelection = false
     @ViewState private var exportPhotos: [Photo] = []
     @ViewState private var showingExport = false
+    @ViewState private var confirmCloseAll = false
     var body: some View {
         HStack(spacing: 0) {
             sidebar.frame(width: 208)
@@ -30,7 +31,7 @@ struct LibraryView: View {
                 Divider()
                 HStack {
                     if store.busy { ProgressView().controlSize(.small) }
-                    Text(store.status).lineLimit(1)
+                    Text(store.status).lineLimit(1).help(store.status)
                     Spacer()
                     if store.busy && store.progress > 0 {
                         ProgressView(value: store.progress).frame(width: 80)
@@ -57,7 +58,13 @@ struct LibraryView: View {
         } message: {
             Text("共 \(store.rejected.reduce(0) { $0 + $1.files.count }) 个 JPG / ARW 文件，\(readableBytes(store.rejected.reduce(0) { $0 + $1.bytes }))。操作前会再次核对配对关系；有歧义的照片不会删除。")
         }
-        .task { if !store.albums.isEmpty { store.scan() } }
+        .alert("关闭所有相册？", isPresented: $confirmCloseAll) {
+            Button("取消", role: .cancel) {}
+            Button("关闭所有相册") { store.closeAllAlbums() }
+        } message: {
+            Text("将关闭列表中的 \(store.albums.count) 个相册，并清除相关的废纸篓撤销记录。磁盘上的照片和标记会保留。")
+        }
+        .task { store.scanOnLaunch() }
         .task(id: store.selected) { await store.loadMetadata() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in if !store.busy { store.refreshHistory() } }
         .onChange(of: store.visible.map(\.id)) { _, _ in store.reconcileSelection() }
@@ -73,27 +80,43 @@ struct LibraryView: View {
             nav("未配对", icon: "link", count: store.photos.filter { !$0.paired }.count)
             nav("待检查", icon: "exclamationmark.triangle", count: store.photos.filter(\.ambiguous).count)
             nav("待删除", icon: "trash", count: store.rejected.count)
-            HStack { Text("拍摄相册"); Spacer(); Text("\(store.albums.count)") }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 24).padding(.top, 30).padding(.bottom, 10)
-            ScrollView {
-                VStack(spacing: 3) {
-                    ForEach(store.albums) { album in
-                        Button {
-                            store.album = album.id; store.filter = "全部照片"
-                        } label: {
-                            HStack(alignment: .top, spacing: 9) { Image(systemName: store.unavailable.contains(album.id) ? "externaldrive.badge.exclamationmark" : "folder").foregroundStyle(accent); Text(album.title).lineLimit(2); Spacer(minLength: 0); Text("\(store.photos.filter { $0.albumID == album.id }.count)").font(.caption2).foregroundStyle(.secondary) }
-                                .font(.system(size: 12)).padding(.horizontal, 12).padding(.vertical, 9)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(store.album == album.id ? accent.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 6))
-                                .contentShape(Rectangle())
-                        }.buttonStyle(.plain).disabled(store.busy)
-                            .help(album.roots.urls.map(\.path).joined(separator: "\n"))
-                            .contextMenu {
-                                Button("在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting(album.roots.urls) }
-                                Button("关闭并移除相册") { store.closeAlbum(album.id) }.disabled(store.busy)
-                                Text("只从列表移除，磁盘照片保留")
-                            }
-                    }
-                }.padding(.horizontal, 12)
+            HStack {
+                Text("拍摄相册")
+                Spacer()
+                Text("\(store.albums.count)")
+                Button { confirmCloseAll = true } label: {
+                    Label("关闭所有相册", systemImage: "xmark.circle").labelStyle(.iconOnly)
+                }
+                .buttonStyle(.borderless)
+                .help("关闭所有相册，保留磁盘照片")
+                .disabled(store.busy || store.editorActive || store.albums.isEmpty)
+            }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 24).padding(.top, 30).padding(.bottom, 10)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(spacing: 3) {
+                        ForEach(store.albums) { album in
+                            Button {
+                                store.album = album.id; store.filter = "全部照片"
+                            } label: {
+                                HStack(alignment: .top, spacing: 9) { Image(systemName: store.unavailable.contains(album.id) ? "externaldrive.badge.exclamationmark" : "folder").foregroundStyle(accent); Text(album.title).lineLimit(2); Spacer(minLength: 0); Text("\(store.photos.filter { $0.albumID == album.id }.count)").font(.caption2).foregroundStyle(.secondary) }
+                                    .font(.system(size: 12)).padding(.horizontal, 12).padding(.vertical, 9)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(store.album == album.id ? accent.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                                    .contentShape(Rectangle())
+                            }.buttonStyle(.plain).disabled(store.busy && !store.scanningAlbums)
+                                .id(album.id)
+                                .help(album.roots.urls.map(\.path).joined(separator: "\n"))
+                                .overlay {
+                                    AlbumContextMenu(roots: album.roots.urls, canClose: !store.busy && !store.editorActive) {
+                                        store.closeAlbum(album.id)
+                                    }
+                                }
+                        }
+                    }.padding(.horizontal, 12)
+                }
+                .onChange(of: store.importedAlbumReveal) {
+                    if let album = store.album { proxy.scrollTo(album, anchor: .top) }
+                }
             }
             Spacer(minLength: 16)
             VStack(alignment: .leading, spacing: 8) {
@@ -157,9 +180,9 @@ struct LibraryView: View {
                 Text("打开已有照片目录，在原位配对浏览；\n导入新拍摄时，按日期和地点分类复制。").foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(6)
             }
             HStack(spacing: 12) {
-                Button("打开相册") { store.settings = true }.buttonStyle(.borderedProminent)
-                Button("导入新照片") { store.importing = true }
-            }.disabled(store.busy)
+                Button("打开相册") { store.settings = true }.buttonStyle(.borderedProminent).disabled(store.busy)
+                Button("导入新照片") { store.importing = true }.disabled(store.busy && !store.scanningAlbums)
+            }
             Text("源文件保留 · 删除进入系统废纸篓").font(.caption).foregroundStyle(.tertiary)
             Spacer()
         }.frame(maxWidth: .infinity)
@@ -303,31 +326,91 @@ struct ImportView: View {
     @EnvironmentObject var store: LibraryStore
     @Environment(\.dismiss) private var dismiss
     @ViewState private var source = ""
+    @ViewState private var selectedSources: [URL] = []
     @ViewState private var location = ""
+    @ViewState private var lookupGPS = true
     @ViewState private var jpgDestination = ""
     @ViewState private var rawDestination = ""
     @ViewState private var plan: [ImportItem] = []
-    @ViewState private var planning = false
+    @ViewState private var previewTask: Task<Void, Never>?
+    @ViewState private var confirmingImport = false
+    @ViewState private var conflictChoice = LibraryService.ImportConflictChoice.skip
     @ViewState private var problem: String?
+    private var planning: Bool { previewTask != nil || confirmingImport }
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("导入一次拍摄").font(.title2.weight(.semibold))
             Text("按 YYYYMMDD_地点 分类，分别复制到 JPG 和 RAW 文件夹。").foregroundStyle(.secondary)
-            HStack { TextField("来源文件夹或相机存储卡", text: $source); Button("选择…") { if let path = store.chooseDirectory() { source = path } } }.disabled(planning)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    if selectedSources.isEmpty {
+                        TextField("来源文件夹或相机存储卡", text: $source)
+                    } else {
+                        Text("已选择 \(selectedSources.count) 个来源文件夹")
+                        Spacer()
+                        Button("清空") { selectedSources = []; source = "" }
+                    }
+                    Button("选择文件夹…") { chooseSources() }
+                }
+                if !selectedSources.isEmpty {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(selectedSources, id: \.self) { url in
+                                Text(url.path).font(.caption).textSelection(.enabled)
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(height: 76)
+                }
+            }.disabled(planning)
             TextField("地点（可选）：留空读取照片信息，无法获取时使用“未知”", text: $location).disabled(planning)
+            if location.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Toggle("在线根据 GPS 补全地点", isOn: $lookupGPS)
+                    .help("关闭后仍读取照片内已有地点，找不到时使用「未知」，可缩短预览时间。")
+                    .disabled(planning)
+            }
             destinationRow("JPG 存放位置", path: $jpgDestination, fallback: destinationRoots.jpg)
             destinationRow("RAW 存放位置", path: $rawDestination, fallback: destinationRoots.raw)
-            Text("存放位置留空时，在来源文件夹同级创建 JPG、RAW；两边使用相同分类文件夹名称。").font(.caption).foregroundStyle(.secondary)
-            if planning { ProgressView("正在读取拍摄信息…") }
-            if let problem { Text(problem).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
+            Text("存放位置留空时，在列表中第一个来源文件夹同级创建 JPG、RAW；两边使用相同分类文件夹名称。").font(.caption).foregroundStyle(.secondary)
+            if selectedSources.count > 1 {
+                Text("整批共用存放位置。本批同名照片会自动改名，JPG 和 RAW 共用后缀。").font(.caption).foregroundStyle(.secondary)
+            }
+            if previewTask != nil {
+                ProgressView("正在生成导入预览…")
+            } else if confirmingImport {
+                ProgressView(conflictChoice == .replace && plan.contains(where: \.conflicts)
+                    ? "正在核验同名目标文件…" : "正在准备导入…")
+            }
+            if let problem {
+                ScrollView {
+                    Text(problem)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(height: problem.contains("\n") ? 150 : 36)
+            }
             if !plan.isEmpty {
                 Divider()
+                let conflicts = plan.filter(\.conflicts).count
+                if conflicts > 0 {
+                    Picker("\(conflicts) 个同名目标", selection: $conflictChoice) {
+                        ForEach(LibraryService.ImportConflictChoice.allCases, id: \.self) { choice in
+                            Text(choice.rawValue).tag(choice)
+                        }
+                    }.disabled(planning)
+                    if conflictChoice == .replace {
+                        Text("替换会覆盖同名目标照片，无法通过拾影撤销。").font(.caption).foregroundStyle(.orange)
+                    } else {
+                        Text("同一张照片的 JPG 和 RAW 会一起跳过或改名。").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 HStack { Text("导入计划").font(.headline); Spacer(); Text("\(plan.count) 个文件 · \(readableBytes(plan.reduce(0) { $0 + $1.bytes }))").foregroundStyle(.secondary) }
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
+                    LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(plan) { item in
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(item.source.lastPathComponent).font(.system(size: 12, weight: .medium))
+                                if item.conflicts { Text("目标已存在").font(.caption2).foregroundStyle(.orange) }
                                 Text(item.destination.path).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
                             }.frame(maxWidth: .infinity, alignment: .leading)
                         }
@@ -335,25 +418,45 @@ struct ImportView: View {
                 }.frame(height: 190)
                 if plan.contains(where: \.fallbackDate) { Label("部分文件没有拍摄时间，将使用文件修改日期。请核对目标日期。", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange) }
             }
-            Text("复制后逐文件校验，不覆盖重名文件，来源照片保留。地点优先使用填写内容，其次读取照片地点或在线反查 GPS，失败时归为“未知”。").font(.caption).foregroundStyle(.secondary)
+            Text("逐文件校验复制内容，来源照片保留。地点优先使用填写内容，其次读取照片地点，再按选项在线反查 GPS，无法获取时归为“未知”。").font(.caption).foregroundStyle(.secondary)
             HStack {
-                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).disabled(planning)
+                Button(previewTask == nil ? "取消" : "取消预览") {
+                    if previewTask != nil { cancelPreview() } else { dismiss() }
+                }.keyboardShortcut(.cancelAction).disabled(confirmingImport)
                 Spacer()
                 if plan.isEmpty {
-                    Button("预览导入计划") { makePlan() }.buttonStyle(.borderedProminent).disabled(planning || source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("预览导入计划") { makePlan() }.buttonStyle(.borderedProminent).disabled(planning || sources.isEmpty)
                 } else {
-                    Button("重新规划") { plan = [] }
-                    Button("复制并校验") { store.executeImport(plan, roots: destinationRoots); dismiss() }.buttonStyle(.borderedProminent)
+                    Button("重新规划") { plan = []; problem = nil }.disabled(planning)
+                    Button(conflictChoice == .replace && plan.contains(where: \.conflicts) ? "替换并导入" : "复制并校验") { prepareImport() }.buttonStyle(.borderedProminent).disabled(planning || store.busy)
                 }
             }
         }.textFieldStyle(.roundedBorder).padding(28).frame(width: 680)
+        .onDisappear { cancelPreview() }
         .onChange(of: source) { _, _ in plan = []; problem = nil }
+        .onChange(of: selectedSources) { _, _ in plan = []; problem = nil }
         .onChange(of: location) { _, _ in plan = []; problem = nil }
+        .onChange(of: lookupGPS) { _, _ in plan = []; problem = nil }
         .onChange(of: jpgDestination) { _, _ in plan = []; problem = nil }
         .onChange(of: rawDestination) { _, _ in plan = []; problem = nil }
     }
+    private var sources: [URL] {
+        if !selectedSources.isEmpty { return selectedSources }
+        let path = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? [] : [URL(fileURLWithPath: path)]
+    }
+    private func chooseSources() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "选择来源"
+        guard panel.runModal() == .OK, let first = panel.urls.first else { return }
+        source = first.path
+        selectedSources = panel.urls.count > 1 ? panel.urls : []
+    }
     private var destinationRoots: Roots {
-        let parent = URL(fileURLWithPath: source).deletingLastPathComponent()
+        let parent = (sources.first ?? URL(fileURLWithPath: source)).deletingLastPathComponent()
         return Roots.importDestinations(jpg: jpgDestination.isEmpty ? parent.appendingPathComponent("JPG").path : jpgDestination,
                      raw: rawDestination.isEmpty ? parent.appendingPathComponent("RAW").path : rawDestination)
     }
@@ -361,19 +464,66 @@ struct ImportView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.caption.weight(.medium))
             HStack {
-                TextField(source.isEmpty ? "可选，默认放在来源文件夹同级" : fallback, text: path)
+                TextField(sources.isEmpty ? "可选，默认放在来源文件夹同级" : fallback, text: path)
                 Button("选择…") { if let selected = store.chooseDirectory() { path.wrappedValue = selected } }
                 if !path.wrappedValue.isEmpty { Button("默认") { path.wrappedValue = "" } }
             }
         }.disabled(planning)
     }
-    private func makePlan() {
-        planning = true; problem = nil
-        let root = destinationRoots; let url = URL(fileURLWithPath: source); let place = location
+    private func prepareImport() {
+        let preview = plan
+        let choice = conflictChoice
+        let roots = destinationRoots
+        confirmingImport = true
+        problem = nil
         Task {
-            do { plan = try await Task.detached { try await LibraryService.importPlanResolvingPlaces(source: url, roots: root, location: place) }.value; if plan.isEmpty { problem = "来源目录中没有找到 JPG 或 ARW 文件。" } }
-            catch { problem = error.localizedDescription }
-            planning = false
+            defer { confirmingImport = false }
+            do {
+                let resolved = try await Task.detached {
+                    try LibraryService.resolveImportConflicts(preview, choice: choice)
+                }.value
+                guard !resolved.isEmpty else { problem = "已跳过全部重名照片，没有文件需要导入。"; return }
+                guard !store.busy else { problem = "照片库正在处理其他任务，请稍后重试。"; return }
+                store.executeImport(resolved, roots: roots)
+                dismiss()
+            } catch {
+                problem = error.localizedDescription
+            }
+        }
+    }
+
+    private func cancelPreview() {
+        guard let previewTask else { return }
+        previewTask.cancel()
+        self.previewTask = nil
+    }
+
+    private func makePlan() {
+        guard !planning else { return }
+        problem = nil
+        conflictChoice = .skip
+        let roots = destinationRoots
+        let urls = sources
+        let place = location
+        let online = lookupGPS
+        previewTask = Task {
+            let worker = Task.detached {
+                try await LibraryService.importPlanResolvingPlaces(sources: urls, roots: roots, location: place, lookupGPS: online)
+            }
+            let result = await withTaskCancellationHandler {
+                await worker.result
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled else { return }
+            previewTask = nil
+            switch result {
+            case .success(let items):
+                plan = items
+                if items.isEmpty { problem = "来源目录中没有找到 JPG 或 ARW 文件。" }
+            case .failure(let error):
+                problem = error.localizedDescription
+            }
         }
     }
 }
@@ -384,6 +534,10 @@ struct ViewerView: View {
     @ViewState private var fitToken = 0
     @StateObject private var info = InspectorState()
     @ViewState private var editingPhoto: Photo?
+    private var preloadWindow: [URL] {
+        guard let current = store.focused?.preview else { return [] }
+        return ViewerImageCache.neighbors(store.visible.map(\.preview), current: current)
+    }
     var body: some View {
         HStack(spacing: 0) {
             ZStack {
@@ -443,6 +597,16 @@ struct ViewerView: View {
         }.overlay(alignment: .top) { WindowHeaderMaterial().frame(height: store.viewerFullScreen ? 0 : 28).allowsHitTesting(false) }.ignoresSafeArea(.container, edges: .top).frame(minWidth: 700, minHeight: 480).background(.black).preferredColorScheme(.dark)
             .accessibilityHidden(editingPhoto != nil).allowsHitTesting(editingPhoto == nil)
             .background { if editingPhoto == nil { ChromeTracking(state: chrome, inspector: info, inspectorEnabled: store.focused.map { store.assessments[$0.id] != nil || store.assessing.contains($0.id) } ?? false).frame(width: 0, height: 0) } }
+        .task(id: preloadWindow) {
+            let urls = preloadWindow
+            await ViewerImageCache.shared.setWindow(urls)
+            for url in urls {
+                guard !Task.isCancelled else { return }
+                guard await ViewerImageCache.shared.decode(url, prefetch: true) != nil else { return }
+                await Task.yield()
+            }
+        }
+        .onDisappear { Task { await ViewerImageCache.shared.clear() } }
         .overlay {
             if let photo = editingPhoto {
                 PhotoEditorView(photo: photo, directory: store.stateURL.deletingLastPathComponent()) { closeWindow in

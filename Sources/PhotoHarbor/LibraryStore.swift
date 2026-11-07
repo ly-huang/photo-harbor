@@ -9,8 +9,11 @@ import AppKit
     @Published var selected: String?
     @Published var filter = "全部照片"
     @Published var album: String?
+    @Published private(set) var importedAlbumReveal = UUID()
     @Published var search = ""
     @Published var busy = false
+    @Published private(set) var scanningAlbums = false
+    private var didStartInitialScan = false
     @Published var trusted = false
     @Published var unavailable: Set<String> = []
     @Published var status = "打开已有相册，或导入一次拍摄。"
@@ -103,36 +106,81 @@ import AppKit
         try JSONEncoder().encode(state).write(to: stateURL, options: .atomic)
     }
     func save() { do { try persist() } catch { self.error = "设置保存失败：\(error.localizedDescription)" } }
-    func scan() {
-        guard !busy else { return }
-        busy = true; trusted = false; status = "正在扫描打开的相册…"
-        Task { await reloadAlbums(); busy = false }
+    func scanOnLaunch() {
+        guard !didStartInitialScan else { return }
+        didStartInitialScan = true
+        if !albums.isEmpty { scan() }
     }
-    private func reloadAlbums() async {
-        var results: [Photo] = [], failed: Set<String> = []
-        for item in state.albums {
-            do {
-                var scanned = try await Task.detached(priority: .userInitiated) { try LibraryService.scan(item.roots) }.value
-                for i in scanned.indices { scanned[i].albumID = item.id }
-                results += scanned
-            } catch { failed.insert(item.id) }
+    func scan(only albumIDs: Set<String>? = nil) {
+        guard !busy else { return }
+        busy = true; scanningAlbums = true; trusted = false
+        status = "正在扫描打开的相册…"
+        Task {
+            await reloadAlbums(only: albumIDs, publishIncrementally: true)
+            scanningAlbums = false
+            busy = false
         }
-        let markPhotos=results,legacy=state.rejected
-        let loaded=await Task.detached { () -> ([String:PhotoAnnotation],Int) in
-            var marks:[String:PhotoAnnotation]=[:],errors=0
-            for photo in markPhotos {
-                do{marks[photo.id]=try PhotoMarkStorage.load(photo,legacyRejected:legacy.contains(photo.id))}
-                catch{
-                    errors+=1
-                    let existing=photo.files.contains{FileManager.default.fileExists(atPath:PhotoMarkStorage.url($0).path)}
-                    marks[photo.id]=PhotoAnnotation(rejected:!existing && legacy.contains(photo.id))
-                }
+    }
+    private func reloadAlbums(only albumIDs: Set<String>? = nil, publishIncrementally: Bool = false) async {
+        var results: [Photo] = []
+        var failed: Set<String> = []
+        var marks: [String: PhotoAnnotation] = [:]
+        var markErrors = 0
+        let previousPhotos = Dictionary(grouping: photos, by: \.albumID)
+        let previousMarks = annotations
+        let previousUnavailable = unavailable
+        let legacy = state.rejected
+        let albumsToLoad = state.albums
+        let scanCount = albumsToLoad.filter { albumIDs?.contains($0.id) ?? true }.count
+        var scannedCount = 0
+        for item in albumsToLoad {
+            if let albumIDs, !albumIDs.contains(item.id) {
+                let cached = previousPhotos[item.id] ?? []
+                results += cached
+                for photo in cached { marks[photo.id] = previousMarks[photo.id] }
+                if previousUnavailable.contains(item.id) { failed.insert(item.id) }
+                continue
             }
-            return(marks,errors)
-        }.value
-        annotations=loaded.0
-        state.rejected=Set(results.filter{annotations[$0.id]?.rejected==true}.map(\.id))
-        if loaded.1>0{error="\(loaded.1) 张照片的目录标记未能读取或迁移，请检查权限及隐藏记录；未对这些照片启用删除标记。"}
+            do {
+                let loaded = try await Task.detached(priority: .userInitiated) {
+                    var scanned = try LibraryService.scan(item.roots)
+                    var index = PhotoMarkStorage.DirectoryIndex()
+                    var annotations: [String: PhotoAnnotation] = [:]
+                    var errors = 0
+                    for i in scanned.indices {
+                        scanned[i].albumID = item.id
+                        let photo = scanned[i]
+                        let id = photo.id
+                        do {
+                            annotations[id] = try index.load(photo, legacyRejected: legacy.contains(id))
+                        } catch {
+                            errors += 1
+                            let existing = photo.files.contains { FileManager.default.fileExists(atPath: PhotoMarkStorage.url($0).path) }
+                            annotations[id] = PhotoAnnotation(rejected: !existing && legacy.contains(id))
+                        }
+                    }
+                    return (scanned, annotations, errors)
+                }.value
+                results += loaded.0
+                marks.merge(loaded.1) { _, fresh in fresh }
+                markErrors += loaded.2
+            } catch { failed.insert(item.id) }
+            if publishIncrementally {
+                scannedCount += 1
+                // Keep untouched albums available while a newly opened album is scanned.
+                if albumIDs == nil {
+                    annotations = marks
+                    photos = results
+                    unavailable = failed
+                    state.rejected = Set(marks.compactMap { $0.value.rejected ? $0.key : nil })
+                    reconcileSelection()
+                }
+                status = "已扫描 \(scannedCount)/\(scanCount) 个相册，已找到 \(results.count) 张照片…"
+            }
+        }
+        annotations = marks
+        state.rejected = Set(marks.compactMap { $0.value.rejected ? $0.key : nil })
+        if markErrors > 0 { error = "\(markErrors) 张照片的目录标记未能读取或迁移，请检查权限及隐藏记录；未对这些照片启用删除标记。" }
         photos = results; unavailable = failed
         state.pruneHistory(availableAlbumIDs: Set(state.albums.map(\.id)).subtracting(failed))
         let currentIDs = Set(results.map(\.id))
@@ -217,22 +265,50 @@ import AppKit
             album = try registerAlbum(roots, title: title)
             try persist()
         } catch { state = previous; throw error }
-        filter = "全部照片"; search = ""; settings = false; scan()
+        filter = "全部照片"; search = ""; settings = false; scan(only: album.map { [$0] })
     }
     func closeAlbum(_ id: String) {
-        guard !busy else { return }
-        let ids = Set(photos.filter { $0.albumID == id }.map(\.id))
-        state.rejected.subtract(ids)
-        annotations=annotations.filter{!ids.contains($0.key)}
-        comparisonSelection.removeAll { ids.contains($0) }
-        state.deletionBatches.removeAll { $0.albumID == id }
-        state.albums.removeAll { $0.id == id }
-        photos.removeAll { $0.albumID == id }; unavailable.remove(id)
-        if album == id { album = nil }
-        if focused == nil { viewerController?.close() }
-        reconcileSelection(); save()
-        status = "已关闭相册，磁盘照片保留。"
+        closeAlbums([id], all: false)
     }
+
+    func closeAllAlbums() {
+        closeAlbums(Set(albums.map(\.id)), all: true)
+    }
+
+    private func closeAlbums(_ albumIDs: Set<String>, all: Bool) {
+        guard !busy, !editorActive, albums.contains(where: { albumIDs.contains($0.id) }) else { return }
+        let photoIDs = Set(photos.filter { albumIDs.contains($0.albumID) }.map(\.id))
+        let previous = state
+        if all { state.rejected.removeAll() } else { state.rejected.subtract(photoIDs) }
+        state.deletionBatches.removeAll { albumIDs.contains($0.albumID) }
+        state.albums.removeAll { albumIDs.contains($0.id) }
+        do {
+            try persist()
+        } catch {
+            state = previous
+            self.error = "无法保存相册列表：\(error.localizedDescription)"
+            return
+        }
+
+        annotations = annotations.filter { !photoIDs.contains($0.key) }
+        comparisonSelection.removeAll { photoIDs.contains($0) }
+        photos.removeAll { albumIDs.contains($0.albumID) }
+        unavailable.subtract(albumIDs)
+        if let album, albumIDs.contains(album) { self.album = nil }
+        if focused == nil { viewerController?.close() }
+        if all {
+            trusted = false
+            annotations.removeAll()
+            comparisonSelection.removeAll()
+            comparisonController?.close()
+            filter = "全部照片"
+            search = ""
+            labelFilter = nil
+        }
+        reconcileSelection()
+        status = all ? "已关闭所有相册，磁盘照片保留。" : "已关闭相册，磁盘照片保留。"
+    }
+
     func showViewer() {
         guard !editorActive else { viewerController?.window?.makeKeyAndOrderFront(nil); return }
         viewer = true
@@ -258,32 +334,62 @@ import AppKit
         Task {
             var completed: [ImportItem] = []
             var outcome = ""
+            var pending: Task<LibraryService.PreparedImport, Error>?
             do {
                 try roots.validate(allowMissing: true)
                 try persist()
-                let log = stateURL.deletingLastPathComponent().appendingPathComponent("import-\(UUID().uuidString).json")
-                var records: [String] = []
-                try JSONEncoder().encode(records).write(to: log, options: .atomic)
-                for item in plan {
+                for (index, item) in plan.enumerated() {
                     if cancellationRequested { break }
                     status = "正在校验复制 \(completed.count + 1)/\(plan.count)：\(item.source.lastPathComponent)"
-                    try await Task.detached(priority: .userInitiated) { try LibraryService.copyVerified(item) }.value
-                    completed.append(item); records.append(item.destination.path)
-                    try JSONEncoder().encode(records).write(to: log, options: .atomic)
+                    let current = pending ?? Task.detached(priority: .userInitiated) { try LibraryService.prepareVerifiedImport(item) }
+                    pending = nil
+                    if index + 1 < plan.count {
+                        let next = plan[index + 1]
+                        pending = Task.detached(priority: .userInitiated) { try LibraryService.prepareVerifiedImport(next) }
+                    }
+                    let prepared = try await current.value
+                    if cancellationRequested {
+                        prepared.discard()
+                        break
+                    }
+                    try await Task.detached(priority: .userInitiated) { try LibraryService.publishVerifiedImport(prepared) }.value
+                    completed.append(item)
                     progress = Double(completed.count) / Double(plan.count)
                 }
                 outcome = "已复制并校验 \(completed.count)/\(plan.count) 个文件。源文件保留。"
             } catch { self.error = "已完成 \(completed.count) 个文件；导入停止：\(error.localizedDescription)"; outcome = "导入已停止，已完成 \(completed.count)/\(plan.count) 个文件。" }
+            if let pending {
+                pending.cancel()
+                if let prepared = try? await pending.value { prepared.discard() }
+            }
             let groups = Dictionary(grouping: completed, by: { $0.destination.deletingLastPathComponent().lastPathComponent })
+            var openedAlbumIDs: [String] = []
+            var seenAlbumIDs = Set<String>()
+            var registrationFailed = false
             for name in groups.keys.sorted() {
                 let items = groups[name]!
                 let j = items.first { !$0.source.pathExtension.lowercased().contains("arw") }?.destination.deletingLastPathComponent().path ?? ""
                 let r = items.first { $0.source.pathExtension.lowercased() == "arw" }?.destination.deletingLastPathComponent().path ?? ""
-                do { album = try registerAlbum(Roots(jpg: j, raw: r), title: name) }
-                catch { self.error = "照片已复制，但相册未自动打开：\(error.localizedDescription)" }
+                do {
+                    let id = try registerAlbum(Roots(jpg: j, raw: r), title: name)
+                    if seenAlbumIDs.insert(id).inserted { openedAlbumIDs.append(id) }
+                }
+                catch {
+                    registrationFailed = true
+                    self.error = "照片已复制，但相册未自动打开：\(error.localizedDescription)"
+                }
+            }
+            if let first = openedAlbumIDs.first {
+                album = first
+                let titles = openedAlbumIDs.compactMap { id in albums.first { $0.id == id }?.title }
+                outcome = "本次导入 \(titles.count) 个相册（\(titles.joined(separator: "、"))）。" + outcome
             }
             filter = "全部照片"; search = ""; save()
-            await reloadAlbums(); status = outcome; busy = false
+            if registrationFailed || !seenAlbumIDs.isEmpty {
+                await reloadAlbums(only: registrationFailed ? nil : seenAlbumIDs)
+            }
+            status = outcome; busy = false
+            if !openedAlbumIDs.isEmpty { importedAlbumReveal = UUID() }
         }
     }
     func deleteRejected() {

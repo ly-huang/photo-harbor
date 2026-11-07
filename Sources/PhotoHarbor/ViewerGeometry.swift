@@ -4,6 +4,9 @@ import CoreGraphics
 // All coordinates use the image's top-left origin; geometry is shared by the
 // main image and navigator so click/drag positions remain consistent on resize.
 enum ViewerGeometry {
+    static func canPan(at point: CGPoint, imageRect: CGRect, viewport: CGSize, zoom: CGFloat, headerInset: CGFloat) -> Bool {
+        zoom > 1.001 && point.y >= headerInset && CGRect(origin: .zero, size: viewport).contains(point) && imageRect.contains(point)
+    }
     static func imageRect(viewport: CGSize, fitSize: CGSize, zoom: CGFloat, offset: CGPoint) -> CGRect {
         CGRect(x: viewport.width / 2 + offset.x - fitSize.width * zoom / 2,
                y: viewport.height / 2 + offset.y - fitSize.height * zoom / 2,

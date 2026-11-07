@@ -28,6 +28,7 @@ func XCTAssertThrowsError<T>(_ value: @autoclosure () throws -> T, file: StaticS
             ("deletion revalidation", suite.testNewCounterpartAndChangedFileBlockDeletion),
             ("symlinks", suite.testSymlinksAreSkipped),
             ("date alignment and verified copy", suite.testPlanAlignsPairDateAndRefusesCollision),
+            ("multi-chunk import and metadata", suite.testStreamingImportPreservesBytesAndMetadata),
             ("overwrite prevention", suite.testCopyNeverOverwritesAndRejectsSymlinkParent),
             ("restore collision", suite.testRestoreRefusesOverwrite),
             ("duplicate import plan", suite.testDuplicateImportDestinationsRejectedBeforeCopy),

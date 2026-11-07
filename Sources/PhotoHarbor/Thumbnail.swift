@@ -5,7 +5,7 @@ final class ImageCache: @unchecked Sendable {
     static let shared = ImageCache()
     let cache = NSCache<NSString, NSImage>()
     let queue = OperationQueue()
-    init() { cache.totalCostLimit = 160 * 1024 * 1024; queue.maxConcurrentOperationCount = 3 }
+    init() { cache.totalCostLimit = 512 * 1024 * 1024; queue.maxConcurrentOperationCount = 3 }
     func load(_ url: URL, size: Int) async -> NSImage? {
         let stamp = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?.timeIntervalSince1970 ?? 0
         let key = "\(url.path):\(size):\(stamp)"

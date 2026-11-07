@@ -11,7 +11,7 @@ GPS 地点反查使用系统 CoreLocation 服务，可能向系统服务发送�
 | 数据 | 默认位置 | 内容与注意事项 |
 | --- | --- | --- |
 | 应用配置 | `~/Library/Application Support/PhotoHarbor/state.json` | 目录路径、相册配置、兼容标记缓存及废纸篓恢复记录。 |
-| 导入清单 | 状态目录中的 `import-UUID.json` | 来源 / 目标路径及已完成项目。 |
+| 导入完成列表 | 任务内存 | 导入结束后释放。旧版生成的 `import-UUID.json` 或 `import-UUID.jsonl` 仅用于人工排查，可删除。 |
 | 滤镜与 LUT 库 | 状态目录中的 `Filters/`、`LUTs/` | 资产副本、名称、摘要及兼容性信息；不保存导入来源路径。 |
 | 原始 JPG 备份 | 照片同级 `.photoharbor-originals/` | 最初照片和校验记录，可能保留完整拍摄元数据。 |
 | 颜色 / 待删除标记 | 照片同级 `.photoharbor-marks/` | 文件名、内容摘要、筛选偏好及更新时间，不含绝对路径和 EXIF。 |

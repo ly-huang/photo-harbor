@@ -2,17 +2,6 @@ import AppKit
 import SwiftUI
 import ImageIO
 
-private actor PhotoDecoder {
-    static let shared = PhotoDecoder()
-    func decode(_ url: URL) -> CGImage? {
-        guard !Task.isCancelled,
-              let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: 8000] as CFDictionary),
-              !Task.isCancelled else { return nil }
-        return image
-    }
-}
-
 @MainActor final class PhotoViewerController: NSWindowController, NSWindowDelegate {
     private weak var store: LibraryStore?
     init(store: LibraryStore) {
@@ -146,6 +135,7 @@ final class PhotoCanvas: NSView {
     var navigatorVisible = true { didSet { if oldValue != navigatorVisible { needsDisplay = true } } }
     private var image: NSImage?
     private var navigatorImage: NSImage?
+    private var navigatorSource: CGImage?
     private var loading: Task<Void, Never>?
     private var zoom: CGFloat = 1
     private var offset = NSPoint.zero
@@ -169,24 +159,14 @@ final class PhotoCanvas: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); window?.makeFirstResponder(self) }
     func load(_ url: URL) {
-        loading?.cancel(); self.url = url; image = nil; navigatorImage = nil; fit()
+        loading?.cancel(); self.url = url; image = nil; navigatorImage = nil; navigatorSource = nil; fit()
         loading = Task { @MainActor [weak self] in
             // Decode away from the UI thread, retaining EXIF orientation for RAW/JPG.
-            let decoded = await PhotoDecoder.shared.decode(url)
+            let decoded = await ViewerImageCache.shared.decode(url)
             guard !Task.isCancelled, let self, self.url == url else { return }
             self.loading = nil
             self.image = decoded.map { NSImage(cgImage: $0, size: .zero) }
-            // Cache a small navigator raster once, avoiding repeated full-photo
-            // downsampling during every wheel or drag event.
-            if let decoded {
-                let factor = min(400 / CGFloat(decoded.width), 270 / CGFloat(decoded.height))
-                let w = max(1, Int(CGFloat(decoded.width) * factor)), h = max(1, Int(CGFloat(decoded.height) * factor))
-                if let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
-                    context.interpolationQuality = .medium
-                    context.draw(decoded, in: CGRect(x: 0, y: 0, width: w, height: h))
-                    self.navigatorImage = context.makeImage().map { NSImage(cgImage: $0, size: .zero) }
-                }
-            }
+            self.navigatorSource = decoded
             self.needsDisplay = true
         }
     }
@@ -194,6 +174,7 @@ final class PhotoCanvas: NSView {
         guard presented !== image else { return }
         presented = image; loading?.cancel()
         self.image = NSImage(cgImage: image, size: .zero)
+        self.navigatorSource = nil
         self.navigatorImage = self.image
         clampOffset(); needsDisplay = true
     }
@@ -201,6 +182,7 @@ final class PhotoCanvas: NSView {
     func fit() {
         zoom = 1; offset = .zero; navigatorDragging = false
         needsDisplay = true
+        refreshPointer()
     }
     private var fitSize: NSSize {
         guard let size = image?.size, size.width > 0, size.height > 0 else { return .zero }
@@ -244,6 +226,18 @@ final class PhotoCanvas: NSView {
                       width: normalized.width * thumbnail.width, height: normalized.height * thumbnail.height)
     }
     private func drawNavigator(_ image: NSImage) {
+        if let decoded = navigatorSource {
+            navigatorSource = nil
+            let factor = min(400 / CGFloat(decoded.width), 270 / CGFloat(decoded.height))
+            let width = max(1, Int(CGFloat(decoded.width) * factor))
+            let height = max(1, Int(CGFloat(decoded.height) * factor))
+            if let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                       space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                context.interpolationQuality = .medium
+                context.draw(decoded, in: CGRect(x: 0, y: 0, width: width, height: height))
+                navigatorImage = context.makeImage().map { NSImage(cgImage: $0, size: .zero) }
+            }
+        }
         let image = navigatorImage ?? image
         let thumbnail = thumbnailRect
         let panel = thumbnail.insetBy(dx: -8, dy: -8)
@@ -270,11 +264,32 @@ final class PhotoCanvas: NSView {
         tracking = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .cursorUpdate, .mouseEnteredAndExited, .mouseMoved], owner: self)
         addTrackingArea(tracking!); super.updateTrackingAreas()
     }
-    override func resetCursorRects() { addCursorRect(bounds, cursor: editingCursor) }
+    private func canPan(at point: CGPoint) -> Bool {
+        image != nil && ViewerGeometry.canPan(at: point, imageRect: editingImageRect, viewport: bounds.size, zoom: zoom, headerInset: fullScreen ? 0 : 28)
+    }
+    private func pointer(at point: CGPoint) -> NSCursor {
+        guard image != nil, bounds.contains(point), point.y >= (fullScreen ? 0 : 28), editingImageRect.contains(point) else { return .arrow }
+        if cropActive || brushTool != nil || rotationActive || isComparing { return editingCursor }
+        return canPan(at: point) ? (dragging || spaceHeld ? .closedHand : .openHand) : .arrow
+    }
+    private func refreshPointer() {
+        window?.invalidateCursorRects(for: self)
+        guard let window, let root = window.contentView else { return }
+        let location = window.mouseLocationOutsideOfEventStream
+        let hit = root.hitTest(root.convert(location, from: nil))
+        (hit === self ? pointer(at: convert(location, from: nil)) : .arrow).set()
+    }
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .arrow)
+        var region = editingImageRect.intersection(bounds)
+        let header = fullScreen ? CGFloat(0) : 28
+        region = region.intersection(CGRect(x: 0, y: header, width: bounds.width, height: max(0, bounds.height - header)))
+        if !region.isNull { addCursorRect(region, cursor: pointer(at: CGPoint(x: region.midX, y: region.midY))) }
+    }
     override func cursorUpdate(with event: NSEvent) {
         guard let root = window?.contentView else { return }
         let hit = root.hitTest(root.convert(event.locationInWindow, from: nil))
-        if hit === self { (dragging ? NSCursor.closedHand : editingCursor).set() }
+        if hit === self { pointer(at: convert(event.locationInWindow, from: nil)).set() }
         else { NSCursor.arrow.set() }
     }
     override func mouseExited(with event: NSEvent) { splitHeld = false; brushPoint=nil; needsDisplay = true; NSCursor.arrow.set() }
@@ -293,6 +308,7 @@ final class PhotoCanvas: NSView {
             moveNavigator(to: point); NSCursor.closedHand.set(); return
         }
         if event.clickCount == 2 { fit(); return }
+        guard canPan(at: point) else { NSCursor.arrow.set(); return }
         dragging = true; NSCursor.closedHand.set()
     }
     override func mouseDragged(with event: NSEvent) {
@@ -300,19 +316,21 @@ final class PhotoCanvas: NSView {
         if splitHeld { comparisonX = convert(event.locationInWindow, from: nil).x; needsDisplay = true; return }
         if cropActive { dragCrop(to: convert(event.locationInWindow, from: nil)); return }
         if navigatorDragging { moveNavigator(to: convert(event.locationInWindow, from: nil)); return }
+        guard dragging else { return }
         offset.x += event.deltaX; offset.y += event.deltaY
         clampOffset(); needsDisplay = true
     }
-    override func mouseUp(with event: NSEvent) { if paintingStroke { paintingStroke=false;painting?(false) };if cropActive { finishCrop(); cropDragMode = -1 }; dragging = false; navigatorDragging = false; editingCursor.set() }
+    override func mouseUp(with event: NSEvent) { if paintingStroke { paintingStroke=false;painting?(false) };if cropActive { finishCrop(); cropDragMode = -1 }; dragging = false; navigatorDragging = false; refreshPointer() }
     override func mouseMoved(with event: NSEvent) {
         if brushTool != nil { brushPoint=convert(event.locationInWindow,from:nil);needsDisplay=true;return }
         updateSplit(flags: event.modifierFlags, point: convert(event.locationInWindow, from: nil))
         if rotationActive { return }
         if cropActive { return }
-        if spaceHeld && !navigatorDragging {
+        if spaceHeld && !navigatorDragging && canPan(at: convert(event.locationInWindow, from: nil)) {
             offset.x += event.deltaX; offset.y += event.deltaY
             clampOffset(); needsDisplay = true; NSCursor.closedHand.set()
         }
+        refreshPointer()
     }
     override func menu(for event: NSEvent) -> NSMenu? {
         window?.makeFirstResponder(self); activated?()
@@ -359,7 +377,7 @@ if labelChanged != nil {
         if characters == "f", event.modifierFlags.intersection([.command, .control, .option]).isEmpty { fit(); return }
         if characters == "0", event.modifierFlags.contains(.command) { fit(); return }
         switch event.keyCode {
-        case 49: spaceHeld = true; NSCursor.openHand.set()
+        case 49: spaceHeld = true; refreshPointer()
         case 51, 117: if !event.isARepeat { mark?() }
         case 123: previous?()
         case 124: next?()
@@ -372,7 +390,7 @@ if labelChanged != nil {
         default: super.keyDown(with: event)
         }
     }
-    override func keyUp(with event: NSEvent) { if event.keyCode == 49 { spaceHeld = false; NSCursor.openHand.set() } else { super.keyUp(with: event) } }
+    override func keyUp(with event: NSEvent) { if event.keyCode == 49 { spaceHeld = false; refreshPointer() } else { super.keyUp(with: event) } }
     override func scrollWheel(with event: NSEvent) {
         if cropActive || rotationActive { return }
         guard image != nil else { return }
@@ -390,5 +408,6 @@ if labelChanged != nil {
         let updated = min(20, max(1, value))
         offset = ViewerGeometry.zoomOffset(offset: offset, anchor: anchor, viewport: bounds.size, ratio: updated / zoom)
         zoom = updated; clampOffset(); needsDisplay = true
+        refreshPointer()
     }
 }

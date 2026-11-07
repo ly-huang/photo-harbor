@@ -23,11 +23,19 @@ import Foundation
         try store.applyRoots(Roots(jpg: a.deletingLastPathComponent().path), title: "第一本")
         try await wait(store)
         let first = store.state.albums[0]
+        let addedWhileOpen = try file("first/later.JPG")
         try store.applyRoots(Roots(raw: b.deletingLastPathComponent().path), title: "第二本")
         try await wait(store)
         let second = store.state.albums[1]
         precondition(store.albums.count == 2 && store.photos.count == 2)
         precondition(store.photos.first { $0.albumID == second.id }?.files.first?.isRAW == true)
+        let reopened = LibraryStore(stateURL: store.stateURL)
+        reopened.scanOnLaunch()
+        try await wait(reopened)
+        precondition(reopened.photos.contains { $0.preview == addedWhileOpen })
+        reopened.scanOnLaunch()
+        precondition(!reopened.busy)
+        try FileManager.default.removeItem(at: addedWhileOpen)
         print("PASS append independent JPG-only and RAW-only albums")
         let compareA = store.photos[0], compareB = store.photos[1]
         store.toggleComparison(compareA); store.toggleComparison(compareB)
@@ -95,6 +103,127 @@ import Foundation
         precondition(store.unavailable.contains(second.id) && store.state.deletionBatches.isEmpty)
         print("PASS unavailable album expires undo history")
 
+        try store.applyRoots(Roots(jpg: a.deletingLastPathComponent().path))
+        try await wait(store)
+        precondition(store.albums.count == 2)
+        store.search = "fixture"
+        store.labelFilter = .orange
+        store.closeAllAlbums()
+        let closedState = try JSONDecoder().decode(SavedState.self, from: Data(contentsOf: store.stateURL))
+        precondition(closedState.albums.isEmpty && closedState.deletionBatches.isEmpty)
+        precondition(store.photos.isEmpty && store.unavailable.isEmpty && store.selected == nil && store.album == nil)
+        precondition(store.search.isEmpty && store.labelFilter == nil && store.comparisonSelection.isEmpty)
+        precondition(FileManager.default.fileExists(atPath: a.path))
+        precondition(FileManager.default.fileExists(atPath: base.appendingPathComponent("disconnected").path))
+        print("PASS close all clears active and offline albums while retaining source files")
+
+        let firstImport = try file("incoming/earlier.JPG")
+        let secondImport = try file("incoming/later.JPG")
+        let importedRoot = base.appendingPathComponent("classified")
+        let importPlan = [
+            ImportItem(source: secondImport, destination: importedRoot.appendingPathComponent("20250831_杭州/later.JPG"), bytes: 7, fallbackDate: false),
+            ImportItem(source: firstImport, destination: importedRoot.appendingPathComponent("20250830_杭州/earlier.JPG"), bytes: 7, fallbackDate: false)
+        ]
+        let previousReveal = store.importedAlbumReveal
+        store.executeImport(importPlan, roots: Roots(jpg: importedRoot.path))
+        try await wait(store)
+        precondition(store.albums.map(\.title) == ["20250830_杭州", "20250831_杭州"])
+        precondition(store.album == store.albums.first?.id && store.importedAlbumReveal != previousReveal)
+        precondition(store.status.contains("2 个相册") && store.status.contains("20250830_杭州、20250831_杭州"))
+        print("PASS multi-album import selects and reveals the first album in sorted order")
+
+        let untouched = try file("classified/20250830_杭州/external.JPG")
+        let pipelineRoot = base.appendingPathComponent("pipeline")
+        let collision = try file("pipeline/20250901_杭州/B.JPG")
+        try Data("existing target".utf8).write(to: collision)
+        let pipelinePlan = try ["A", "B", "C"].map { name in
+            let source = try file("pipeline-source/\(name).JPG")
+            return ImportItem(source: source, destination: pipelineRoot.appendingPathComponent("20250901_杭州/\(name).JPG"), bytes: 7, fallbackDate: false)
+        }
+        store.executeImport(pipelinePlan, roots: Roots(jpg: pipelineRoot.path))
+        try await wait(store)
+        precondition(store.error != nil)
+        precondition(FileManager.default.fileExists(atPath: pipelinePlan[0].destination.path))
+        let collisionContents = try String(contentsOf: collision, encoding: .utf8)
+        precondition(collisionContents == "existing target")
+        precondition(!FileManager.default.fileExists(atPath: pipelinePlan[2].destination.path))
+        let pipelineNames = try FileManager.default.contentsOfDirectory(atPath: collision.deletingLastPathComponent().path)
+        precondition(!pipelineNames.contains { $0.hasPrefix(".import-") })
+        precondition(!store.photos.contains { $0.preview == untouched })
+        store.scan()
+        try await wait(store)
+        precondition(store.photos.contains { $0.preview == untouched })
+        print("PASS import publishes in order, cleans prepared copies on failure and refreshes only affected albums")
+        let stateFiles = try FileManager.default.contentsOfDirectory(atPath: base.path)
+        precondition(!stateFiles.contains {
+            $0.hasPrefix("import-") && ($0.hasSuffix(".json") || $0.hasSuffix(".jsonl"))
+        })
+        print("PASS import does not persist a completion journal")
+
+
+
+        let incoming = try ["card-a", "card-b"].map { card in
+            let jpg = try file("\(card)/A.JPG")
+            _ = try file("\(card)/A.ARW")
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: jpg.path)
+            return jpg.deletingLastPathComponent()
+        }
+        let sharedRoots = Roots(jpg: base.appendingPathComponent("shared-jpg").path,
+                                raw: base.appendingPathComponent("shared-raw").path)
+        let cancelledPreview = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await LibraryService.importPlanResolvingPlaces(sources: incoming, roots: sharedRoots, location: "", lookupGPS: false)
+        }
+        do {
+            _ = try await cancelledPreview.value
+            preconditionFailure("A cancelled preview must not return an import plan")
+        } catch is CancellationError {}
+        let sharedPlan = try await LibraryService.importPlanResolvingPlaces(sources: incoming, roots: sharedRoots, location: "", lookupGPS: false)
+        precondition(!FileManager.default.fileExists(atPath: sharedRoots.jpg))
+        precondition(!FileManager.default.fileExists(atPath: sharedRoots.raw))
+        print("PASS cancelled import preview can be retried without creating destination folders")
+        precondition(sharedPlan.first?.source.deletingLastPathComponent() == incoming[0])
+        precondition(sharedPlan.allSatisfy { $0.destination.deletingLastPathComponent().lastPathComponent.hasSuffix("_未知") })
+        precondition(sharedPlan.count == 4 && Set(sharedPlan.map(\.destination)).count == 4)
+        for group in Dictionary(grouping: sharedPlan, by: \.pairID).values {
+            precondition(group.count == 2)
+            precondition(Set(group.map { $0.destination.deletingPathExtension().lastPathComponent }).count == 1)
+        }
+        for item in sharedPlan { try LibraryService.copyVerified(item) }
+        let sharedAlbum = Roots(jpg: sharedPlan.first { $0.destination.pathExtension == "JPG" }!.destination.deletingLastPathComponent().path,
+                                raw: sharedPlan.first { $0.destination.pathExtension == "ARW" }!.destination.deletingLastPathComponent().path)
+        let paired = try LibraryService.scan(sharedAlbum)
+        precondition(paired.count == 2 && paired.allSatisfy(\.paired))
+        do {
+            _ = try await LibraryService.importPlanResolvingPlaces(sources: [incoming[0], incoming[0].appendingPathComponent("nested")], roots: sharedRoots, location: "测试地点")
+            preconditionFailure("Expected overlapping import sources to be rejected")
+        } catch let error as LibraryError {
+            precondition(error.localizedDescription.contains("互相包含"))
+        }
+        print("PASS multi-source import uses shared roots, preserves pairs on name collisions and rejects overlapping sources")
+
+        let ambiguousJPG = try file("ambiguous-a/one/A.JPG")
+        let ambiguousRAW1 = try file("ambiguous-a/two/A.ARW")
+        let ambiguousRAW2 = try file("ambiguous-a/three/A.ARW")
+        let ambiguousB1 = try file("ambiguous-b/one/B.JPG")
+        let ambiguousB2 = try file("ambiguous-b/two/B.JPG")
+        let missingSource = base.appendingPathComponent("missing-source")
+        let problemSources = [base.appendingPathComponent("ambiguous-a"), base.appendingPathComponent("ambiguous-b"), missingSource]
+        do {
+            _ = try await LibraryService.importPlanResolvingPlaces(sources: problemSources, roots: sharedRoots, location: "测试地点")
+            preconditionFailure("Expected all source problems in one report")
+        } catch let error as LibraryError {
+            let report = error.localizedDescription
+            precondition(report.contains("3 组来源问题"))
+            precondition(report.contains("1 个 JPG、2 个 ARW") && report.contains("2 个 JPG、0 个 ARW"))
+            precondition(([ambiguousJPG, ambiguousRAW1, ambiguousRAW2, ambiguousB1, ambiguousB2, missingSource]).allSatisfy { report.contains($0.path) })
+        }
+        print("PASS import preflight reports every ambiguous group and unreadable source with paths")
+
+
+
+
+
         let marked=LibraryStore(stateURL:base.appendingPathComponent("marks-state.json"))
         try marked.applyRoots(Roots(jpg:a.deletingLastPathComponent().path));try await wait(marked)
         let target=marked.photos.first{$0.preview==a}!
@@ -104,7 +233,7 @@ import Foundation
         precondition(marked.labels(for:target)==[.orange,.blue] && marked.state.rejected.contains(target.id))
         marked.labelFilter = .orange;precondition(marked.visible.contains{$0.id==target.id})
         marked.labelFilter = .gray;precondition(marked.visible.isEmpty && marked.rejected.isEmpty)
-        marked.labelFilter=nil;marked.closeAlbum(marked.albums[0].id)
+        marked.labelFilter=nil;marked.closeAllAlbums()
         try marked.applyRoots(Roots(jpg:a.deletingLastPathComponent().path));try await wait(marked)
         precondition(marked.labels(for:target)==[.orange,.blue] && marked.state.rejected.contains(target.id))
         let independent=LibraryStore(stateURL:base.appendingPathComponent("independent-state.json"))

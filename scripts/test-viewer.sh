@@ -6,3 +6,5 @@ zsh scripts/compile-test.sh .build/viewer-tests/geometry Sources/PhotoHarbor/Vie
 .build/viewer-tests/geometry
 zsh scripts/compile-test.sh .build/viewer-tests/chrome Sources/PhotoHarbor/ViewerChrome.swift scripts/ChromeTests.swift
 .build/viewer-tests/chrome
+zsh scripts/compile-test.sh .build/viewer-tests/cache Sources/PhotoHarbor/ViewerImageCache.swift scripts/ViewerCacheTests.swift
+.build/viewer-tests/cache

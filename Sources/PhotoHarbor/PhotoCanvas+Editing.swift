@@ -1,7 +1,7 @@
 import AppKit
 
 extension PhotoCanvas {
-    var editingCursor: NSCursor { (cropActive || brushTool != nil) ? .crosshair : (rotationActive ? .arrow : (isComparing ? .resizeLeftRight : .openHand)) }
+    var editingCursor: NSCursor { (cropActive || brushTool != nil) ? .crosshair : (rotationActive ? .arrow : (isComparing ? .resizeLeftRight : .arrow)) }
     func drawEditing(in imageRect: CGRect) {
         if isComparing, let comparisonImage {
             let visible = imageRect.intersection(bounds)

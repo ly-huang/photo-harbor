@@ -106,7 +106,45 @@ final class LibraryServiceTests: XCTestCase {
         for item in plan { try LibraryService.copyVerified(item); XCTAssertEqual(try Data(contentsOf: item.source), try Data(contentsOf: item.destination)) }
         XCTAssertTrue(FileManager.default.fileExists(atPath: jpg.path))
         XCTAssertThrowsError(try LibraryService.importPlan(source: source, roots: roots, location: "杭州西湖"))
+        let conflicts = try LibraryService.importPlan(source: source, roots: roots, location: "杭州西湖", allowExisting: true)
+        XCTAssertTrue(conflicts.allSatisfy(\.conflicts))
+        XCTAssertEqual(try LibraryService.resolveImportConflicts(conflicts, choice: .skip).count, 0)
+
+        let retained = try LibraryService.resolveImportConflicts(conflicts, choice: .keepBoth)
+        XCTAssertEqual(retained.count, 2)
+        for item in retained {
+            XCTAssertEqual(item.destination.deletingPathExtension().lastPathComponent, "A (2)")
+            try LibraryService.copyVerified(item)
+        }
+        let replacement = try LibraryService.resolveImportConflicts(conflicts, choice: .replace)
+        try Data("new source".utf8).write(to: jpg)
+        let jpgItem = replacement.first { $0.source == jpg }!
+        let rawItem = replacement.first { $0.source == raw }!
+        try Data("changed destination".utf8).write(to: rawItem.destination)
+        XCTAssertThrowsError(try LibraryService.copyVerified(rawItem))
+        XCTAssertEqual(try String(contentsOf: rawItem.destination, encoding: .utf8), "changed destination")
+        XCTAssertThrowsError(try LibraryService.resolveImportConflicts(conflicts, choice: .replace))
+        try LibraryService.copyVerified(jpgItem)
+        XCTAssertEqual(try String(contentsOf: jpgItem.destination, encoding: .utf8), "new source")
+        XCTAssertEqual(try String(contentsOf: jpg, encoding: .utf8), "new source")
+
     }
+    func testStreamingImportPreservesBytesAndMetadata() throws {
+        let source = try file("source/large.ARW")
+        let destination = base.appendingPathComponent("target/large.ARW")
+        var payload = Data(repeating: 0x21, count: 4 * 1024 * 1024)
+        payload.append(Data(repeating: 0x9b, count: 257))
+        try payload.write(to: source)
+        let modified = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: modified, .posixPermissions: 0o640], ofItemAtPath: source.path)
+        try LibraryService.copyVerified(ImportItem(source: source, destination: destination, bytes: Int64(payload.count), fallbackDate: false))
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertEqual(try Data(contentsOf: source), payload)
+        let attributes = try FileManager.default.attributesOfItem(atPath: destination.path)
+        XCTAssertEqual(attributes[.modificationDate] as? Date, modified)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o640)
+    }
+
     func testCopyNeverOverwritesAndRejectsSymlinkParent() throws {
         let source = try file("source/A.JPG")
         let dest = try file("target/A.JPG", content: "original")

@@ -57,14 +57,19 @@ struct MainToolbar: NSViewRepresentable {
         private func refreshEnabledState() {
             guard let store, let group = actionGroup else { return }
             for (index, item) in group.subitems.enumerated() {
-                let enabled = !store.busy && (index != 0 || !store.albums.isEmpty)
+                let enabled = canPerform(index, in: store)
                 item.isEnabled = enabled
                 (group.view as? NSSegmentedControl)?.setEnabled(enabled, forSegment: index)
             }
         }
+        private func canPerform(_ index: Int, in store: LibraryStore) -> Bool {
+            if store.scanningAlbums && (index == 2 || index == 3) { return true }
+            return !store.busy && (index != 0 || !store.albums.isEmpty)
+        }
         @objc private func performAction(_ sender: Any?) {
-            guard let store, !store.busy else { return }
+            guard let store else { return }
             let index = (sender as? NSToolbarItemGroup)?.selectedIndex ?? (sender as? NSSegmentedControl)?.selectedSegment ?? -1
+            guard canPerform(index, in: store) else { return }
             switch index {
             case 0: if !store.albums.isEmpty { store.scan() }
             case 1: store.settings = true

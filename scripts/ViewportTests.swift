@@ -4,6 +4,14 @@ import CoreGraphics
 @main struct ViewportTests {
     static func near(_ a: CGFloat, _ b: CGFloat) { precondition(abs(a - b) < 0.000001, "\(a) differs from \(b)") }
     static func main() {
+        let imageRect = CGRect(x: 100, y: 0, width: 800, height: 700)
+        let cursorViewport = CGSize(width: 1000, height: 800)
+        precondition(!ViewerGeometry.canPan(at: CGPoint(x: 300, y: 300), imageRect: imageRect, viewport: cursorViewport, zoom: 1, headerInset: 28))
+        precondition(ViewerGeometry.canPan(at: CGPoint(x: 300, y: 300), imageRect: imageRect, viewport: cursorViewport, zoom: 2, headerInset: 28))
+        precondition(!ViewerGeometry.canPan(at: CGPoint(x: 300, y: 12), imageRect: imageRect, viewport: cursorViewport, zoom: 2, headerInset: 28))
+        precondition(!ViewerGeometry.canPan(at: CGPoint(x: 20, y: 300), imageRect: imageRect, viewport: cursorViewport, zoom: 2, headerInset: 28))
+        precondition(!ViewerGeometry.canPan(at: CGPoint(x: 300, y: 750), imageRect: imageRect, viewport: cursorViewport, zoom: 2, headerInset: 28))
+        print("PASS pan cursor applies only to zoomed image pixels, excluding header and letterbox")
         let viewport = CGSize(width: 1000, height: 800)
         let fit = CGSize(width: 1000, height: 500)
         let entire = ViewerGeometry.visibleRegion(viewport: viewport, fitSize: fit, zoom: 1, offset: .zero)

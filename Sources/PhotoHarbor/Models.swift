@@ -81,7 +81,14 @@ struct Metadata: Sendable {
     var place = ""
     var latitude: Double?
     var longitude: Double?
-    static func read(_ url: URL) -> Metadata {
+    static func captureDateFormatter() -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+        return formatter
+    }
+
+    static func read(_ url: URL, importFormatter: DateFormatter? = nil) -> Metadata {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let p = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] else { return Metadata() }
         let exif = p[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
@@ -95,8 +102,10 @@ struct Metadata: Sendable {
             result.latitude = abs(lat.doubleValue) * ((gps[kCGImagePropertyGPSLatitudeRef as String] as? String) == "S" ? -1 : 1)
             result.longitude = abs(lon.doubleValue) * ((gps[kCGImagePropertyGPSLongitudeRef as String] as? String) == "W" ? -1 : 1)
         }
-        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
-        if let value = exif[kCGImagePropertyExifDateTimeOriginal as String] as? String ?? tiff[kCGImagePropertyTIFFDateTime as String] as? String { result.date = formatter.date(from: value) }
+        if let value = exif[kCGImagePropertyExifDateTimeOriginal as String] as? String ?? tiff[kCGImagePropertyTIFFDateTime as String] as? String {
+            result.date = (importFormatter ?? captureDateFormatter()).date(from: value)
+        }
+        if importFormatter != nil { return result }
         result.camera = tiff[kCGImagePropertyTIFFModel as String] as? String ?? "未知相机"
         if let w = p[kCGImagePropertyPixelWidth as String], let h = p[kCGImagePropertyPixelHeight as String] { result.dimensions = "\(w) × \(h)" }
         if let f = exif[kCGImagePropertyExifFNumber as String] { result.exposure = "ƒ/\(f)" }
@@ -112,9 +121,13 @@ struct Metadata: Sendable {
 
 struct ImportItem: Identifiable, Sendable {
     let source: URL
-    let destination: URL
+    var destination: URL
     let bytes: Int64
     let fallbackDate: Bool
+    var pairID: String? = nil
+    var conflicts = false
+    var conflictVersion: String? = nil
+    var replacement: String? = nil
     var id: String { source.path }
 }
 struct TrashRecord: Codable, Sendable { let original: URL; let trashed: URL }

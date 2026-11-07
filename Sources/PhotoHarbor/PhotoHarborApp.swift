@@ -16,7 +16,7 @@ import AppKit
         .defaultSize(width: 1380, height: 880)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("导入照片…") { store.importing = true }.keyboardShortcut("i").disabled(store.busy)
+                Button("导入照片…") { store.importing = true }.keyboardShortcut("i").disabled(store.busy && !store.scanningAlbums)
                 Button("打开相册…") { store.settings = true }.keyboardShortcut("o").disabled(store.busy)
             }
             CommandMenu("照片") {
