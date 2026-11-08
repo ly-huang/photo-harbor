@@ -19,6 +19,7 @@ import AppKit
 }
 
 struct ComparisonView: View {
+    @ViewState private var photoAction: PhotoContextRequest?
     @EnvironmentObject var store: LibraryStore
     @StateObject private var chrome = ChromeState()
     @ViewState private var fitToken = 0
@@ -72,6 +73,7 @@ struct ComparisonView: View {
             }
         }.overlay(alignment: .top) { WindowHeaderMaterial().frame(height: store.comparisonFullScreen ? 0 : 28).allowsHitTesting(false) }.ignoresSafeArea(.container, edges: .top).frame(minWidth: 1000, minHeight: 700).background(.black).preferredColorScheme(.dark)
             .background(ChromeTracking(state: chrome, inspector: info, inspectorWidth: comparisonInfoWidth).frame(width: 0, height: 0))
+        .sheet(item: $photoAction) { PhotoContextSheet(request: $0).environmentObject(store) }
         .task(id: selected.map(\.id)) {
             assessment = nil; analyzing = false; activeIndex = 0
             let captured = selected
@@ -89,6 +91,9 @@ struct ComparisonView: View {
             evaluate: { activeIndex = index; store.assessPhoto(photo); info.reveal() },
             showInfo: { activeIndex = index; info.reveal() }, activated: { if activeIndex != index { activeIndex = index } },
             toggleNavigator: { store.navigatorVisible.toggle() }, labels:store.labels(for:photo),labelChanged:{if let label=$0{store.toggleLabel(label,photo:photo)}else{store.clearLabels(photo)}}, rejected: store.state.rejected.contains(photo.id), navigatorTopInset: 44,
+            fileAction: store.editorActive || store.busy ? nil : {
+                photoAction = PhotoContextRequest(action: $0, photos: [photo])
+            }, canDelete: store.trusted && !photo.ambiguous,
             previous: {}, next: {}, mark: { store.toggleReject(photo) })
             .id(photo.id).frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay(alignment: .bottomLeading) {

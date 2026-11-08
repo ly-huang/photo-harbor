@@ -31,9 +31,9 @@ struct GroupAssessment: Sendable {
 }
 actor AssessmentService {
     static let shared = AssessmentService()
-    private struct Entry { let stats: PhotoAssessment; let feature: VNFeaturePrintObservation? }
+    private struct Entry { let stats: PhotoAssessment; let feature: Any? }
     private var cache: [String: Entry] = [:]
-    private func analyze(_ url: URL) throws -> Entry {
+    private func analyze(_ url: URL) async throws -> Entry {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         let stamp = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         let key = "\(url.path)|\(stamp)|\(attributes[.size] ?? "")"
@@ -42,52 +42,61 @@ actor AssessmentService {
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: 1024] as CFDictionary) else { throw LibraryError.message("无法解码对比照片：\(url.lastPathComponent)") }
         var stats = pixelMetrics(image)
         stats.metadata = Metadata.read(url)
-        var feature: VNFeaturePrintObservation?
-        do {
+        var feature: Any?
+        if #available(macOS 15.0, *) {
+            var request = GenerateImageFeaturePrintRequest(.revision2)
+            request.cropAndScaleAction = .scaleToFit
+            feature = try? await request.perform(on: image)
+            if let observation = try? await CalculateImageAestheticsScoresRequest(.revision1).perform(on: image) {
+                stats.aesthetics = Double(observation.overallScore + 1) * 50
+                stats.aestheticsNote = observation.isUtility ? "系统判为记录用途；评分仅供参考" : "Apple Vision 模型参考分"
+            } else { stats.aestheticsNote = "本机审美模型暂不可用" }
+        } else {
             let request = VNGenerateImageFeaturePrintRequest()
             request.revision = VNGenerateImageFeaturePrintRequestRevision2
             request.imageCropAndScaleOption = .scaleFit
-            try VNImageRequestHandler(cgImage: image).perform([request])
-            feature = request.results?.first
-        } catch { /* Pixel metrics and aesthetics remain independently available. */ }
-        if #available(macOS 15.0, *) {
-            do {
-                let request = VNCalculateImageAestheticsScoresRequest()
-                try VNImageRequestHandler(cgImage: image).perform([request])
-                if let observation = request.results?.first {
-                    stats.aesthetics = Double(observation.overallScore + 1) * 50
-                    stats.aestheticsNote = observation.isUtility ? "系统判为记录用途；评分仅供参考" : "Apple Vision 模型参考分"
-                } else { stats.aestheticsNote = "模型未返回评分" }
-            } catch { stats.aestheticsNote = "本机审美模型暂不可用" }
-        } else { stats.aestheticsNote = "审美评分需要 macOS 15 或更新版本" }
+            if (try? VNImageRequestHandler(cgImage: image).perform([request])) != nil {
+                feature = request.results?.first
+            }
+            stats.aestheticsNote = "审美评分需要 macOS 15 或更新版本"
+        }
         let entry = Entry(stats: stats, feature: feature)
         if cache.count >= 100 { cache.removeAll() }
         cache[key] = entry
         return entry
     }
-    func compare(_ a: URL, _ b: URL) throws -> PairAssessment {
-        let left = try analyze(a), right = try analyze(b)
+    private func distance(_ first: Any, _ second: Any) throws -> Float {
+        if #available(macOS 15.0, *), let first = first as? FeaturePrintObservation, let second = second as? FeaturePrintObservation {
+            return Float(try first.distance(to: second))
+        }
+        guard let first = first as? VNFeaturePrintObservation, let second = second as? VNFeaturePrintObservation else {
+            throw LibraryError.message("图像特征版本不一致。")
+        }
+        var value: Float = 0
+        try first.computeDistance(&value, to: second)
+        return value
+    }
+    func compare(_ a: URL, _ b: URL) async throws -> PairAssessment {
+        let left = try await analyze(a), right = try await analyze(b)
         var result = PairAssessment(left: left.stats, right: right.stats)
         if let first = left.feature, let second = right.feature {
-            var distance: Float = 0
-            do { try first.computeDistance(&distance, to: second); result.distance = distance }
+            do { result.distance = try distance(first, second) }
             catch { result.similarityNote = "相似度分析未完成" }
         } else { result.similarityNote = "本机图像特征模型暂不可用" }
         return result
     }
-    func assess(_ url: URL) throws -> PhotoAssessment { try analyze(url).stats }
-    func compareMany(_ urls: [URL]) -> GroupAssessment {
+    func assess(_ url: URL) async throws -> PhotoAssessment { try await analyze(url).stats }
+    func compareMany(_ urls: [URL]) async -> GroupAssessment {
         var entries: [Entry?] = [], errors: [String?] = []
         for url in urls {
-            do { entries.append(try analyze(url)); errors.append(nil) }
+            do { entries.append(try await analyze(url)); errors.append(nil) }
             catch { entries.append(nil); errors.append(error.localizedDescription) }
         }
         var distances: [AssessmentDistance] = []
         for i in entries.indices {
             for j in entries.indices where j > i {
                 if let first = entries[i]?.feature, let second = entries[j]?.feature {
-                    var value: Float = 0
-                    do { try first.computeDistance(&value, to: second); distances.append(AssessmentDistance(first: i, second: j, value: value)) }
+                    do { distances.append(AssessmentDistance(first: i, second: j, value: try distance(first, second))) }
                     catch { /* Other pairs remain usable. */ }
                 }
             }

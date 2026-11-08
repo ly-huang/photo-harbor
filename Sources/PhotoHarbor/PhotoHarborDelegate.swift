@@ -7,7 +7,7 @@ import AppKit
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         writeIconReportIfRequested()
     }
 

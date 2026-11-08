@@ -75,6 +75,7 @@ import UniformTypeIdentifiers
         let engine = PhotoEditEngine(softwareRendering: true)
         let opened = try await engine.open(renderURL)
         precondition(opened.image.width == 64 && opened.image.height == 48)
+        precondition(opened.faces == 0)
         func pixel(_ image: CGImage) -> [UInt8] {
             var bytes = [UInt8](repeating: 0, count: 4)
             bytes.withUnsafeMutableBytes { memory in

@@ -3,6 +3,7 @@ import SwiftUI
 struct ComparisonSelectionPopover: View {
     @EnvironmentObject var store: LibraryStore
     let openComparison: () -> Void
+    let onAction: (PhotoContextAction, [Photo]) -> Void
     private var photos: [Photo] { store.comparisonPhotos }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -33,6 +34,7 @@ struct ComparisonSelectionPopover: View {
                                         }.buttonStyle(.plain).padding(5).help("移出对比：\(photo.name)")
                                             .accessibilityLabel("移出对比 \(photo.name)")
                                     }
+                                    .contextMenu { PhotoFileActions(photos: [photo], perform: onAction) }
                                 HStack(spacing: 5) {
                                     Text("\(index + 1)").font(.caption.bold()).foregroundStyle(.secondary)
                                     Text(photo.name).font(.caption.weight(.medium)).lineLimit(1)

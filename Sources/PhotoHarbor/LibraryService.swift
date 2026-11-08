@@ -1,27 +1,68 @@
 import Foundation
 import CryptoKit
 import CoreLocation
+import MapKit
 import Darwin
 
 struct LibraryService {
     static let manager = FileManager.default
-    static func scanFiles(_ root: URL, extensions: Set<String>, includeIdentity: Bool = true) throws -> [PhotoFile] {
+    static func scanFiles(_ root: URL, extensions: Set<String>, includeIdentity: Bool = true,
+                          deletionKeys: Set<String>? = nil, fallbackStems: Set<String> = []) throws -> [PhotoFile] {
         let root = canonicalURL(root)
+        var relevantDirectories: Set<String> = []
+        if let deletionKeys, fallbackStems.isEmpty {
+            for key in deletionKeys {
+                var directory = (key as NSString).deletingLastPathComponent
+                while !directory.isEmpty {
+                    relevantDirectories.insert(directory)
+                    directory = (directory as NSString).deletingLastPathComponent
+                }
+            }
+        }
+        var keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey]
+        let rootVolume = includeIdentity ? (try? root.resourceValues(forKeys: [.volumeIdentifierKey]).volumeIdentifier) : nil
+        let rootDevice = rootVolume != nil ? (try? manager.attributesOfItem(atPath: root.path)[.systemNumber] as? NSNumber) : nil
+        if rootDevice != nil { keys.formUnion([.fileIdentifierKey, .creationDateKey, .volumeIdentifierKey]) }
+        var useEnumeratedIdentity: Bool?
         var failure: Error?
-        guard let iterator = manager.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles], errorHandler: { _, error in failure = error; return false }) else { throw LibraryError.message("无法读取目录：\(root.path)") }
+        guard let iterator = manager.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles], errorHandler: { _, error in failure = error; return false }) else { throw LibraryError.message("无法读取目录：\(root.path)") }
         var files: [PhotoFile] = []
         for case let enumeratedURL as URL in iterator {
             try Task.checkCancellation()
             let url = enumeratedURL
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey])
+            let values = try url.resourceValues(forKeys: keys)
             if values.isSymbolicLink == true { iterator.skipDescendants(); continue }
+            let relative = String(url.path.dropFirst(root.path.count + 1))
+            if let deletionKeys {
+                if values.isDirectory == true, fallbackStems.isEmpty,
+                   !relevantDirectories.contains(relative.lowercased()) {
+                    iterator.skipDescendants()
+                }
+                let relativeStem = (relative as NSString).deletingPathExtension.lowercased()
+                let stem = (relativeStem as NSString).lastPathComponent
+                guard deletionKeys.contains(relativeStem) || fallbackStems.contains(stem) else { continue }
+            }
             guard values.isRegularFile == true, extensions.contains(url.pathExtension.lowercased()) else { continue }
             var identity = ""
             if includeIdentity {
-                let attributes = try manager.attributesOfItem(atPath: url.path)
-                identity = "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? ""):\(attributes[.creationDate] ?? "")"
+                let enumerated: String?
+                if let rootDevice, let rootVolume, let volume = values.volumeIdentifier, rootVolume.isEqual(volume),
+                   let inode = values.fileIdentifier, inode != 0, let created = values.creationDate {
+                    enumerated = "\(rootDevice):\(inode):\(created)"
+                } else {
+                    enumerated = nil
+                }
+                if useEnumeratedIdentity == true, let enumerated {
+                    identity = enumerated
+                } else {
+                    let attributes = try manager.attributesOfItem(atPath: url.path)
+                    identity = "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? ""):\(attributes[.creationDate] ?? "")"
+                    if useEnumeratedIdentity == nil, let enumerated {
+                        useEnumeratedIdentity = enumerated == identity
+                    }
+                }
             }
-            files.append(PhotoFile(url: url, relative: String(url.path.dropFirst(root.path.count + 1)), bytes: Int64(values.fileSize ?? 0), modified: values.contentModificationDate ?? .distantPast, identity: identity))
+            files.append(PhotoFile(url: url, relative: relative, bytes: Int64(values.fileSize ?? 0), modified: values.contentModificationDate ?? .distantPast, identity: identity))
         }
         if let failure { throw failure }
         return files.sorted { $0.relative.localizedStandardCompare($1.relative) == .orderedAscending }
@@ -249,7 +290,7 @@ struct LibraryService {
                 let conflict = index.contains(dest)
                 guard destinations.insert(dest.path.lowercased()).inserted || input.multipleSources, allowExisting || !conflict else { throw LibraryError.message("目标文件重名，未执行导入：\(dest.path)") }
                 plan.append(ImportItem(source: file.url, destination: dest, bytes: file.bytes, fallbackDate: captureDate == nil, pairID: photo.preview.path, conflicts: conflict,
-                                       conflictVersion: conflict ? try? importFileVersion(dest) : nil))
+                                       conflictVersion: conflict ? try? importFileVersion(dest, replacing: true) : nil))
             }
         }
         return input.multipleSources ? try uniqueBatchDestinations(plan, index: &index) : plan
@@ -323,18 +364,8 @@ struct LibraryService {
             let key = String(format: "%.2f,%.2f", lat, lon)
             if let cached = cache[key] { places[photo.preview.path] = cached; continue }
             if lookupUnavailable { continue }
-            let geocoder = CLGeocoder()
-            let timeout = Task { try? await Task.sleep(nanoseconds: 8_000_000_000); if !Task.isCancelled { geocoder.cancelGeocode() } }
-            defer { timeout.cancel() }
             do {
-                let marks = try await withTaskCancellationHandler {
-                    try Task.checkCancellation()
-                    return try await geocoder.reverseGeocodeLocation(CLLocation(latitude: lat, longitude: lon), preferredLocale: Locale(identifier: "zh_CN"))
-                } onCancel: {
-                    Task { @MainActor in geocoder.cancelGeocode() }
-                }
-                let mark = marks.first
-                let name = [mark?.locality ?? mark?.administrativeArea, mark?.subLocality].compactMap { $0 }.joined()
+                let name = try await reversePlace(CLLocation(latitude: lat, longitude: lon))
                 cache[key] = name.isEmpty ? "未知" : name
                 places[photo.preview.path] = cache[key]
             } catch {
@@ -344,6 +375,36 @@ struct LibraryService {
         }
         return try buildImportPlan(input, resolvedPlaces: places, allowExisting: true, index: &destinations)
     }
+    @MainActor private static func reversePlace(_ location: CLLocation) async throws -> String {
+        let locale = Locale(identifier: "zh_CN")
+        if #available(macOS 26.0, *), let request = MKReverseGeocodingRequest(location: location) {
+            request.preferredLocale = locale
+            return try await withGeocodeTimeout(cancel: { request.cancel() }) {
+                try await request.mapItems.first?.addressRepresentations?.cityName ?? ""
+            }
+        }
+        let geocoder = CLGeocoder()
+        return try await withGeocodeTimeout(cancel: { geocoder.cancelGeocode() }) {
+            let mark = try await geocoder.reverseGeocodeLocation(location, preferredLocale: locale).first
+            return [mark?.locality ?? mark?.administrativeArea, mark?.subLocality].compactMap { $0 }.joined()
+        }
+    }
+
+    @MainActor private static func withGeocodeTimeout(cancel: @escaping @MainActor @Sendable () -> Void,
+                                                      lookup: () async throws -> String) async throws -> String {
+        let timeout = Task {
+            try await Task.sleep(nanoseconds: 8_000_000_000)
+            cancel()
+        }
+        defer { timeout.cancel() }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await lookup()
+        } onCancel: {
+            Task { @MainActor in cancel() }
+        }
+    }
+
     static func digest(_ url: URL, chunkSize: Int = 1024 * 1024) throws -> SHA256.Digest {
         let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
         var hash = SHA256()
@@ -354,23 +415,15 @@ struct LibraryService {
         manager.fileExists(atPath: url.path) || (try? manager.destinationOfSymbolicLink(atPath: url.path)) != nil
     }
 
-    private static func importFileVersion(_ url: URL) throws -> String {
-        let attributes = try manager.attributesOfItem(atPath: url.path)
-        guard attributes[.type] as? FileAttributeType == .typeRegular,
-              canonicalURL(url).path == url.path else {
-            throw LibraryError.message("导入校验只支持普通文件，不支持文件夹或符号链接。")
+    private static func importFileVersion(_ url: URL, replacing: Bool = false) throws -> String {
+        var info = stat()
+        guard canonicalURL(url).path == url.path, lstat(url.path, &info) == 0,
+              info.st_mode & S_IFMT == S_IFREG,
+              !replacing || (info.st_ino != 0 && (info.st_ctimespec.tv_sec != 0 || info.st_ctimespec.tv_nsec != 0)) else {
+            throw LibraryError.message("无法核验导入文件的版本，请检查文件和存储设备。")
         }
-        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        return "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? ""):\(attributes[.size] ?? ""):\(modified)"
-    }
-
-    private static func importTargetSignature(_ url: URL) throws -> String {
-        let version = try importFileVersion(url)
-        let hash = try digest(url)
-        guard try importFileVersion(url) == version else {
-            throw LibraryError.message("目标正在变化，请重新预览导入计划。")
-        }
-        return "\(version):\(hash)"
+        let modified = info.st_mtimespec, changed = info.st_ctimespec
+        return "\(info.st_dev):\(info.st_ino):\(info.st_size):\(modified.tv_sec):\(modified.tv_nsec):\(changed.tv_sec):\(changed.tv_nsec)"
     }
 
     // Album name and stem form the pairing key even when the two formats live in different roots.
@@ -437,14 +490,10 @@ struct LibraryService {
                 resolved += try group.map { item in
                     var item = item
                     if item.conflicts {
-                        guard let version = item.conflictVersion, try importFileVersion(item.destination) == version else {
+                        guard let version = item.conflictVersion, try importFileVersion(item.destination, replacing: true) == version else {
                             throw LibraryError.message("目标已变化或不能替换，请重新预览导入计划。")
                         }
-                        let signature = try importTargetSignature(item.destination)
-                        guard signature.hasPrefix(version + ":") else {
-                            throw LibraryError.message("目标已变化，请重新预览导入计划。")
-                        }
-                        item.replacement = signature
+                        item.replacement = version
                     }
                     return item
                 }
@@ -457,7 +506,7 @@ struct LibraryService {
 
     private static let importChunkSize = 4 * 1024 * 1024
 
-    private static func streamImport(_ source: URL, to temporary: URL) throws -> SHA256.Digest {
+    static func streamPhotoCopy(_ source: URL, to temporary: URL) throws -> SHA256.Digest {
         let sourceFD = Darwin.open(source.path, O_RDONLY | O_NOFOLLOW)
         guard sourceFD >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         let input = FileHandle(fileDescriptor: sourceFD, closeOnDealloc: true)
@@ -501,7 +550,7 @@ struct LibraryService {
         let sourceVersion = try importFileVersion(item.source)
         let prepared = PreparedImport(item: item, temporary: temporary, sourceVersion: sourceVersion)
         do {
-            let expectedDigest = try streamImport(item.source, to: temporary)
+            let expectedDigest = try streamPhotoCopy(item.source, to: temporary)
             try Task.checkCancellation()
             guard try digest(temporary, chunkSize: importChunkSize) == expectedDigest else {
                 throw LibraryError.message("文件校验失败：\(item.source.lastPathComponent)")
@@ -523,7 +572,7 @@ struct LibraryService {
             throw LibraryError.message("来源或目标路径已变化，停止导入：\(item.source.lastPathComponent)")
         }
         if let expected = item.replacement {
-            guard try importTargetSignature(item.destination) == expected else {
+            guard try importFileVersion(item.destination, replacing: true) == expected else {
                 throw LibraryError.message("目标已变化，未替换：\(item.destination.lastPathComponent)")
             }
             _ = try manager.replaceItemAt(item.destination, withItemAt: prepared.temporary)
@@ -536,7 +585,28 @@ struct LibraryService {
         try publishVerifiedImport(prepareVerifiedImport(item))
     }
     static func validateDeletion(_ photos: [Photo], roots: Roots) throws {
-        let fresh = try scan(roots)
+        try roots.validate()
+        var exactKeys: Set<String> = []
+        var fallbackStems: Set<String> = []
+        for photo in photos {
+            guard !photo.ambiguous, let first = photo.files.first else {
+                throw LibraryError.message("照片配对存在歧义，请重新扫描后检查。")
+            }
+            if photo.paired, photo.files.allSatisfy({ $0.relativeStem == first.relativeStem }) {
+                exactKeys.insert(first.relativeStem)
+            } else {
+                fallbackStems.insert(first.stem)
+            }
+        }
+        // Exact pairs take precedence over matches elsewhere. Fallback pairing
+        // needs every candidate with the same stem, including exact pairs.
+        let jpg = try roots.jpgURL.map {
+            try scanFiles($0, extensions: ["jpg", "jpeg"], deletionKeys: exactKeys, fallbackStems: fallbackStems)
+        } ?? []
+        let raw = try roots.rawURL.map {
+            try scanFiles($0, extensions: ["arw"], deletionKeys: exactKeys, fallbackStems: fallbackStems)
+        } ?? []
+        let fresh = pair(jpg: jpg, raw: raw)
         let byID = Dictionary(uniqueKeysWithValues: fresh.map { ($0.id, $0) })
         for photo in photos {
             guard !photo.ambiguous, let current = byID[photo.id], !current.ambiguous, Set(current.files) == Set(photo.files) else { throw LibraryError.message("文件或配对关系已变化：\(photo.name)。请重新扫描后检查。") }
@@ -545,27 +615,28 @@ struct LibraryService {
             }
         }
     }
-    static func trash(_ file: PhotoFile) throws -> TrashRecord {
-        var result: NSURL?
-        try manager.trashItem(at: file.url, resultingItemURL: &result)
-        guard let result else { throw LibraryError.message("系统未返回废纸篓位置：\(file.url.path)") }
-        return TrashRecord(original: file.url, trashed: result as URL)
-    }
     static func validateFileIdentity(_ file: PhotoFile) throws {
         let a=try FileManager.default.attributesOfItem(atPath:file.url.path)
         let identity="\(a[.systemNumber] ?? ""):\(a[.systemFileNumber] ?? ""):\(a[.creationDate] ?? "")"
         guard a[.type] as? FileAttributeType == .typeRegular,identity==file.identity,(a[.size] as? NSNumber)?.int64Value==file.bytes,a[.modificationDate] as? Date==file.modified else{throw LibraryError.message("照片已变化，请重新扫描后再设置标记。")}
     }
-    static func deletePermanently(_ file: PhotoFile) throws {
+    static func validateRemoval(_ file: PhotoFile) throws {
         guard canonicalURL(file.url).path == file.url.path else { throw LibraryError.message("照片路径包含符号链接。") }
         try validateFileIdentity(file)
+    }
+    static func deletePermanently(_ file: PhotoFile) throws {
+        try validateRemoval(file)
         guard unlink(file.url.path) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
-    static func restore(_ record: TrashRecord) throws {
+    static func restore(_ record: TrashRecord, roots: Roots? = nil) throws {
         guard !manager.fileExists(atPath: record.original.path) else { throw LibraryError.message("恢复目标已存在，未覆盖：\(record.original.path)") }
-        try manager.createDirectory(at: record.original.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let parent = record.original.deletingLastPathComponent()
+        if !manager.fileExists(atPath: parent.path) {
+            try roots?.validate()
+            try manager.createDirectory(at: parent, withIntermediateDirectories: true)
+        }
         try manager.moveItem(at: record.trashed, to: record.original)
     }
 }

@@ -10,7 +10,7 @@ import AppKit
                 .frame(minWidth: 1060, minHeight: 680)
                 .preferredColorScheme(.dark)
                 .onAppear {
-                    NSApplication.shared.activate(ignoringOtherApps: true)
+                    NSApplication.shared.activate()
                 }
         }
         .defaultSize(width: 1380, height: 880)

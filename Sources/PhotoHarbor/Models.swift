@@ -96,8 +96,12 @@ struct Metadata: Sendable {
     }
 
     static func read(_ url: URL, importFormatter: DateFormatter? = nil) -> Metadata {
+        readIfAvailable(url, importFormatter: importFormatter) ?? Metadata()
+    }
+
+    static func readIfAvailable(_ url: URL, importFormatter: DateFormatter? = nil) -> Metadata? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let p = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] else { return Metadata() }
+              let p = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] else { return nil }
         let exif = p[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
         let tiff = p[kCGImagePropertyTIFFDictionary as String] as? [String: Any] ?? [:]
         let gps = p[kCGImagePropertyGPSDictionary as String] as? [String: Any] ?? [:]
@@ -137,7 +141,7 @@ struct ImportItem: Identifiable, Sendable {
     var replacement: String? = nil
     var id: String { source.path }
 }
-struct TrashRecord: Codable, Sendable { let original: URL; let trashed: URL }
+struct TrashRecord: Codable, Equatable, Sendable { let original: URL; let trashed: URL }
 struct OpenAlbum: Codable, Identifiable, Equatable, Sendable {
     var id = UUID().uuidString
     var title: String
@@ -151,7 +155,7 @@ struct OpenAlbum: Codable, Identifiable, Equatable, Sendable {
     }
 }
 private extension String { var nonEmpty: String? { isEmpty ? nil : self } }
-struct DeletionBatch: Codable, Identifiable, Sendable {
+struct DeletionBatch: Codable, Equatable, Identifiable, Sendable {
     var id = UUID().uuidString
     let albumID: String
     var date = Date()
@@ -183,11 +187,12 @@ struct SavedState: Codable {
         try values.encode(albums, forKey: .albums)
         try values.encode(deletionBatches, forKey: .deletionBatches)
     }
-    mutating func pruneHistory(availableAlbumIDs: Set<String>) {
-        for i in deletionBatches.indices {
+    mutating func pruneHistory(availableAlbumIDs: Set<String>, only albumIDs: Set<String>? = nil) {
+        deletionBatches.removeAll { !availableAlbumIDs.contains($0.albumID) }
+        for i in deletionBatches.indices where albumIDs?.contains(deletionBatches[i].albumID) ?? true {
             deletionBatches[i].records.removeAll { !FileManager.default.fileExists(atPath: $0.trashed.path) }
         }
-        deletionBatches.removeAll { !availableAlbumIDs.contains($0.albumID) || $0.records.isEmpty }
+        deletionBatches.removeAll { $0.records.isEmpty }
     }
 }
 func readableBytes(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) }

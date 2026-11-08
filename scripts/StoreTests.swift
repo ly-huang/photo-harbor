@@ -93,6 +93,20 @@ import AppKit
         try await wait(groupedStore)
         precondition(groupedStore.albums.map(\.id) == albumIDs)
         print("PASS opening archive folders pairs within named subfolders and prevents overlapping or duplicate albums")
+        groupedStore.album = nil
+        let batch = groupedStore.photos
+        groupedStore.setLabel(.blue, enabled: true, for: batch)
+        try await wait(groupedStore)
+        precondition(batch.allSatisfy { groupedStore.labels(for: $0) == [.blue] })
+        groupedStore.setRejected(true, for: batch)
+        try await wait(groupedStore)
+        precondition(groupedStore.rejected.count == 3)
+        precondition(batch.allSatisfy { groupedStore.labels(for: $0) == [.blue] })
+        groupedStore.deleteRejected(permanently: true)
+        try await wait(groupedStore)
+        precondition(groupedStore.error == nil && groupedStore.photos.isEmpty && groupedStore.undoBatches.isEmpty)
+        precondition(batch.flatMap(\.files).allSatisfy { !FileManager.default.fileExists(atPath: $0.url.path) })
+        print("PASS bulk color and deletion marks persist independently and direct deletion processes the batch")
         let compareA = store.photos[0], compareB = store.photos[1]
         store.toggleComparison(compareA); store.toggleComparison(compareB)
         precondition(store.comparisonPhotos.count == 2)
@@ -125,7 +139,7 @@ import AppKit
         store.album = first.id
         store.toggleReject(compareA)
         try await wait(store)
-        store.deleteRejected { _ in throw CocoaError(.fileWriteNoPermission) }
+        store.deleteRejected { _ in ([:], "没有移动权限") }
         try await wait(store)
         precondition(store.error != nil && store.status.contains("未能"))
         precondition(store.rejected.map(\.id) == [compareA.id] && store.undoBatches.isEmpty)
@@ -147,10 +161,10 @@ import AppKit
         partialStore.toggleReject(partialStore.photos[0])
         try await wait(partialStore)
         let firstMember = partialStore.photos[0].files[0].url
-        partialStore.deleteRejected { member in
-            guard member.url == firstMember else { throw CocoaError(.fileWriteNoPermission) }
-            try FileManager.default.moveItem(at: member.url, to: trashCopy)
-            return TrashRecord(original: member.url, trashed: trashCopy)
+        partialStore.deleteRejected { urls in
+            precondition(Set(urls) == [pairedJPG, pairedRAW])
+            try! FileManager.default.moveItem(at: firstMember, to: trashCopy)
+            return ([firstMember: trashCopy], "另一份文件未移动")
         }
         try await wait(partialStore)
         precondition(partialStore.undoBatches.first?.records.count == 1)
@@ -180,6 +194,28 @@ import AppKit
         precondition(!FileManager.default.fileExists(atPath: pairedRAW.path))
         print("PASS direct deletion checks both members before removing either and creates no undo record")
 
+        let chosen = try file("context/CHOSEN.JPG")
+        let markedNeighbor = try file("context/KEEP.JPG")
+        let contextStore = LibraryStore(stateURL: base.appendingPathComponent("context-state.json"))
+        try contextStore.applyRoots(Roots(jpg: chosen.deletingLastPathComponent().path, raw: ""))
+        try await wait(contextStore)
+        let chosenPhoto = contextStore.photos.first { $0.preview == chosen }!
+        let untouchedPhoto = contextStore.photos.first { $0.preview == markedNeighbor }!
+        let initialIDs = contextStore.visibleIDs
+        contextStore.setRejected(true, for: [untouchedPhoto])
+        try await wait(contextStore)
+        precondition(contextStore.visibleIDs == initialIDs)
+        contextStore.filter = "待删除"
+        precondition(contextStore.visibleIDs == [untouchedPhoto.id])
+        contextStore.deletePhotos([chosenPhoto], permanently: true, completion: { error in
+            precondition(error == nil)
+        })
+        try await wait(contextStore)
+        precondition(contextStore.visibleIDs == [untouchedPhoto.id] && contextStore.photos.count == 1)
+        precondition(!FileManager.default.fileExists(atPath: chosen.path))
+        precondition(FileManager.default.fileExists(atPath: markedNeighbor.path))
+        print("PASS contextual deletion targets only the chosen photo regardless of the rejected filter")
+
         let one = try file("trash/one.JPG"), two = try file("trash/two.JPG")
         let stale = base.appendingPathComponent("trash/gone.JPG")
         let originalOne = a.deletingLastPathComponent().appendingPathComponent("one.JPG")
@@ -187,7 +223,10 @@ import AppKit
         let batch1 = DeletionBatch(albumID: first.id, records: [TrashRecord(original: originalOne, trashed: one)])
         let batch2 = DeletionBatch(albumID: first.id, records: [TrashRecord(original: originalTwo, trashed: two), TrashRecord(original: base.appendingPathComponent("first/gone.JPG"), trashed: stale)])
         store.state.deletionBatches = [batch1, batch2]; store.album = first.id
+        let unrelatedUndo = try file("second/undo-scan-sentinel.ARW")
         store.undoTrash(); try await wait(store)
+        precondition(!store.photos.contains { $0.preview == unrelatedUndo })
+        try FileManager.default.removeItem(at: unrelatedUndo)
         precondition(FileManager.default.fileExists(atPath: originalTwo.path))
         precondition(FileManager.default.fileExists(atPath: one.path))
         precondition(store.state.deletionBatches.count == 1)
@@ -214,8 +253,11 @@ import AppKit
         let offlineRecord = try file("trash/offline.ARW")
         store.state.deletionBatches.append(DeletionBatch(albumID: second.id, records: [TrashRecord(original: b, trashed: offlineRecord)]))
         try FileManager.default.moveItem(at: b.deletingLastPathComponent(), to: base.appendingPathComponent("disconnected"))
-        store.scan(); try await wait(store)
+        store.album = second.id
+        store.undoTrash(); try await wait(store)
         precondition(store.unavailable.contains(second.id) && store.state.deletionBatches.isEmpty)
+        precondition(FileManager.default.fileExists(atPath: offlineRecord.path))
+        precondition(!FileManager.default.fileExists(atPath: b.deletingLastPathComponent().path))
         print("PASS unavailable album expires undo history")
 
         try store.applyRoots(Roots(jpg: a.deletingLastPathComponent().path))
@@ -354,8 +396,14 @@ import AppKit
         let independent=LibraryStore(stateURL:base.appendingPathComponent("independent-state.json"))
         try independent.applyRoots(Roots(jpg:a.deletingLastPathComponent().path));try await wait(independent)
         precondition(independent.labels(for:target)==[.orange,.blue] && independent.state.rejected.contains(target.id))
+        let otherAlbum = try file("edit-unrelated/fixture.ARW").deletingLastPathComponent()
+        try independent.applyRoots(Roots(raw: otherAlbum.path))
+        try await wait(independent)
+        let unrelatedEdit = try file("edit-unrelated/edit-scan-sentinel.ARW")
         try Data("fixture edited".utf8).write(to:a)
         await independent.reloadAfterEditing(a)
+        precondition(!independent.photos.contains { $0.preview == unrelatedEdit })
+        try FileManager.default.removeItem(at: unrelatedEdit)
         let edited=independent.photos.first{$0.preview==a}!
         precondition(independent.labels(for:edited)==[.orange,.blue] && !independent.state.rejected.contains(edited.id))
         independent.clearLabels(edited);try await wait(independent)

@@ -47,6 +47,20 @@ actor ViewerImageCache {
         let image: CGImage
         var cost: Int { image.bytesPerRow * image.height }
     }
+    private struct PendingDecode {
+        let id = UUID()
+        let signature: String
+        let prefetch: Bool
+        let task: Task<CGImage?, Never>
+    }
+    private struct VersionQuery {
+        let id = UUID()
+        let task: Task<String?, Never>
+        var waiters = 1
+    }
+    private var versionQueries: [URL: VersionQuery] = [:]
+    private var generation = 0
+    private var pending: [URL: PendingDecode] = [:]
     private let foregroundDecoder = ViewerRasterDecoder()
     private let backgroundDecoder = ViewerRasterDecoder()
     private let maximumBytes: Int
@@ -83,6 +97,7 @@ actor ViewerImageCache {
             budget = min(maximumBytes, max(64 * 1024 * 1024, budget))
         }
         for url in priority.reversed() where cost > budget { remove(url) }
+        if budget == 0 { cancelDecodes { _, decode in decode.prefetch } }
     }
 
     static func neighbors(_ urls: [URL], current: URL) -> [URL] {
@@ -105,6 +120,8 @@ actor ViewerImageCache {
             budget = min(maximumBytes, max(64 * 1024 * 1024, budget * 2))
         }
         priority = urls
+        let window = Set(urls)
+        cancelDecodes { url, decode in decode.prefetch && !window.contains(url) }
         // Keep useful entries across small moves, even if a neighbor is still loading.
         // Reclaim the old window immediately on a distant jump.
         let overlaps = urls.prefix(3).contains { entries[$0] != nil }
@@ -113,9 +130,20 @@ actor ViewerImageCache {
     }
 
     func clear() {
+        generation += 1
+        for query in versionQueries.values { query.task.cancel() }
+        versionQueries.removeAll()
+        cancelDecodes { _, _ in true }
         priority.removeAll()
         entries.removeAll()
         cost = 0
+    }
+
+    private func cancelDecodes(where shouldCancel: (URL, PendingDecode) -> Bool) {
+        for (url, decode) in pending.filter({ shouldCancel($0.key, $0.value) }) {
+            decode.task.cancel()
+            pending.removeValue(forKey: url)
+        }
     }
 
     private func remove(_ url: URL) {
@@ -126,18 +154,57 @@ actor ViewerImageCache {
         startPressureMonitor()
         guard !Task.isCancelled, !prefetch || (budget > 0 && priority.contains(url)) else { return nil }
         let freshURL = URL(fileURLWithPath: url.path)
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: freshURL.path) else { remove(url); return nil }
-        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        let signature = "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? ""):\(attributes[.size] ?? ""):\(modified)"
+        let windowGeneration = generation
+        let query: VersionQuery
+        if var existing = versionQueries[url] {
+            existing.waiters += 1
+            versionQueries[url] = existing
+            query = existing
+        } else {
+            query = VersionQuery(task: Task.detached(priority: prefetch ? .utility : .userInitiated) {
+                guard !Task.isCancelled,
+                      let attributes = try? FileManager.default.attributesOfItem(atPath: freshURL.path) else { return nil }
+                let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+                return "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? ""):\(attributes[.size] ?? ""):\(modified)"
+            })
+            versionQueries[url] = query
+        }
+        let version = await query.task.value
+        if var active = versionQueries[url], active.id == query.id {
+            active.waiters -= 1
+            versionQueries[url] = active.waiters == 0 ? nil : active
+        }
+        guard generation == windowGeneration, !Task.isCancelled,
+              !prefetch || (budget > 0 && priority.contains(url)) else { return nil }
+        guard let signature = version else { remove(url); return nil }
         if let cached = entries[url], cached.signature == signature { return cached.image }
         remove(url)
-        let availableBytes = prefetch ? budget - priority.prefix { $0 != url }.reduce(0) { $0 + (entries[$1]?.cost ?? 0) } : nil
-        let decoder = prefetch ? backgroundDecoder : foregroundDecoder
-        guard let image = await decoder.decode(freshURL, availableBytes: availableBytes), !Task.isCancelled else { return nil }
-        if let cached = entries[url] {
-            // Another decode may have cached a newer version while this one was suspended.
-            return cached.signature == signature ? cached.image : (prefetch ? nil : image)
+        let request: PendingDecode
+        if let existing = pending[url], existing.signature == signature {
+            request = existing
+        } else {
+            pending[url]?.task.cancel()
+            let availableBytes = prefetch ? budget - priority.prefix { $0 != url }.reduce(0) { $0 + (entries[$1]?.cost ?? 0) } : nil
+            let decoder = prefetch ? backgroundDecoder : foregroundDecoder
+            let task = Task {
+                await decoder.decode(freshURL, availableBytes: availableBytes)
+            }
+            request = PendingDecode(signature: signature, prefetch: prefetch, task: task)
+            pending[url] = request
         }
+        let result = await request.task.value
+        let ownsSlot = pending[url]?.id == request.id
+        if ownsSlot { pending.removeValue(forKey: url) }
+        guard !Task.isCancelled else { return nil }
+        if let cached = entries[url], cached.signature == signature { return cached.image }
+        guard let image = result else {
+            // A prefetch may decline a raster that exceeds its memory allowance.
+            if !prefetch && request.prefetch {
+                return await decode(url)
+            }
+            return nil
+        }
+        guard ownsSlot else { return prefetch ? nil : image }
         if prefetch && !priority.contains(url) { return nil }
         let entry = Entry(signature: signature, image: image)
         if let rank = priority.firstIndex(of: url), entry.cost <= budget {

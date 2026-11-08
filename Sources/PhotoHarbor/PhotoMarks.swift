@@ -11,7 +11,10 @@ struct PhotoMarkRecord:Codable,Sendable {
     var version=1
     let filename:String
     let bytes:Int64
-    let digest:String
+    let digest: String?
+    var identity: String?
+    var modified: Date?
+    var colorUpdated: Date?
     var annotation:PhotoAnnotation
     var updated=Date()
 }
@@ -23,15 +26,22 @@ enum PhotoMarkStorage {
         try EditPersistence.rejectLinks(file.url)
         try LibraryService.validateFileIdentity(file)
     }
-    private static func read(_ file:PhotoFile)throws->PhotoMarkRecord? {
+    private static func read(_ file:PhotoFile)throws->(record: PhotoMarkRecord, data: Data)? {
         let target=url(file)
         guard FileManager.default.fileExists(atPath:target.path) else{return nil}
         try EditPersistence.rejectLinks(target)
         let size=try target.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? Int.max
         guard size<=16384 else{throw LibraryError.message("照片标记记录过大。")}
-        let record=try JSONDecoder().decode(PhotoMarkRecord.self,from:Data(contentsOf:target))
-        guard record.version==1,record.filename==file.url.lastPathComponent,record.digest.count==64,record.digest.allSatisfy(\.isHexDigit) else{throw LibraryError.message("照片标记记录无效。")}
-        return record
+        let data = try Data(contentsOf: target)
+        let record=try JSONDecoder().decode(PhotoMarkRecord.self,from:data)
+        let digestValid = record.digest.map { $0.count == 64 && $0.allSatisfy(\.isHexDigit) } ?? false
+        guard record.filename == file.url.lastPathComponent,
+              (record.digest == nil || digestValid),
+              (record.version == 1 && digestValid ||
+               (2...3).contains(record.version) && record.identity != nil && record.modified != nil) else {
+            throw LibraryError.message("照片标记记录无效。")
+        }
+        return (record, data)
     }
     struct DirectoryIndex {
         private var names: [URL: Set<String>] = [:]
@@ -63,42 +73,80 @@ enum PhotoMarkStorage {
         }
     }
     static func load(_ photo:Photo,legacyRejected:Bool=false, candidates: Set<URL>? = nil)throws->PhotoAnnotation {
-        var records:[PhotoMarkRecord]=[],mismatch=false,found=false
+        var valid: [PhotoMarkRecord] = []
+        var found = false
         for file in photo.files {
             if let candidates, !candidates.contains(file.url) { continue }
-            guard let record=try read(file) else{continue};found=true
-            guard record.bytes==file.bytes else{mismatch=true;continue}
-            try checkFile(file);let digest=try EditPersistence.hash(file.url);try checkFile(file)
-            guard record.digest==digest else{mismatch=true;continue};records.append(record)
+            guard let record = try read(file)?.record else { continue }
+            found = true
+            guard record.bytes == file.bytes else { continue }
+            if record.version == 1 {
+                // Older records have no file identity. Verify their original digest before trusting them.
+                guard try EditPersistence.hash(file.url) == record.digest else { continue }
+            } else {
+                guard record.identity == file.identity, record.modified == file.modified else { continue }
+            }
+            try checkFile(file)
+            valid.append(record)
         }
         if !found && legacyRejected {
-            let migrated=PhotoAnnotation(rejected:true);try save(migrated,for:photo);return migrated
+            let migrated = PhotoAnnotation(rejected: true)
+            try save(migrated, for: photo)
+            return migrated
         }
-        var result=records.max{$0.updated<$1.updated}?.annotation ?? PhotoAnnotation()
-        // Any changed member invalidates a pair's destructive flag, even when RAW is unchanged.
-        if mismatch{result.rejected=false}
-        return result
+        guard let latest = valid.max(by: { $0.updated < $1.updated }),
+              valid.count == photo.files.count else { return PhotoAnnotation() }
+        return latest.annotation
     }
-    static func save(_ annotation:PhotoAnnotation,for photo:Photo)throws {
-        var prepared:[(URL,Data,Data?)]=[]
-        let date=Date()
-        for file in photo.files {
-            try checkFile(file);let digest=try EditPersistence.hash(file.url);try checkFile(file)
-            let folder=directory(file),target=url(file)
-            if FileManager.default.fileExists(atPath:folder.path){try EditPersistence.rejectLinks(folder)}
-            else{try FileManager.default.createDirectory(at:folder,withIntermediateDirectories:false);try EditPersistence.rejectLinks(folder)}
-            var old:Data?
-            if FileManager.default.fileExists(atPath:target.path){_ = try read(file);old=try Data(contentsOf:target)}
-            let record=PhotoMarkRecord(filename:file.url.lastPathComponent,bytes:file.bytes,digest:digest,annotation:annotation,updated:date)
-            prepared.append((target,try JSONEncoder().encode(record),old))
+
+    private struct PreparedMark: Sendable {
+        let target: URL
+        let data: Data
+        let previous: Data?
+    }
+
+    private static func prepare(_ annotation: PhotoAnnotation, file: PhotoFile, date: Date) throws -> PreparedMark {
+        try checkFile(file)
+        let target = url(file)
+        let previous = try read(file)
+        let record = PhotoMarkRecord(version: 3, filename: file.url.lastPathComponent, bytes: file.bytes,
+                                     digest: nil, identity: file.identity, modified: file.modified,
+                                     annotation: annotation, updated: date)
+        return PreparedMark(target: target, data: try JSONEncoder().encode(record), previous: previous?.data)
+    }
+
+    static func save(_ annotation: PhotoAnnotation, for photo: Photo) throws {
+        let date = Date()
+        try commit(photo, prepared: photo.files.map { try prepare(annotation, file: $0, date: date) })
+    }
+
+    static func savePair(_ annotation: PhotoAnnotation, for photo: Photo) async throws {
+        let date = Date()
+        let prepared = try await withThrowingTaskGroup(of: PreparedMark.self) { group in
+            for file in photo.files {
+                group.addTask { try prepare(annotation, file: file, date: date) }
+            }
+            var prepared: [PreparedMark] = []
+            for try await item in group { prepared.append(item) }
+            return prepared
         }
+        try commit(photo, prepared: prepared)
+    }
+
+    private static func commit(_ photo: Photo, prepared: [PreparedMark]) throws {
         for file in photo.files{try checkFile(file)}
         var committed:[(URL,Data?)]=[]
         do {
-            for (target,data,old) in prepared {
-                try EditPersistence.rejectLinks(target.deletingLastPathComponent())
+            for item in prepared {
+                let target = item.target
+                let folder = target.deletingLastPathComponent()
+                if !FileManager.default.fileExists(atPath: folder.path) {
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                }
+                try EditPersistence.rejectLinks(folder)
                 if FileManager.default.fileExists(atPath:target.path){try EditPersistence.rejectLinks(target)}
-                try data.write(to:target,options:.atomic);committed.append((target,old))
+                try item.data.write(to: target, options: .atomic)
+                committed.append((target, item.previous))
             }
         } catch {
             // Cross-volume writes cannot be atomic; restore committed copies when possible.
@@ -107,7 +155,8 @@ enum PhotoMarkStorage {
         }
     }
     static func consumeRejection(_ file:PhotoFile)throws {
-        guard var record=try read(file) else{return}
+        guard var record=try read(file)?.record else{return}
+        record.colorUpdated = record.colorUpdated ?? record.updated
         record.annotation.rejected=false;record.updated=Date()
         try JSONEncoder().encode(record).write(to:url(file),options:.atomic)
     }

@@ -16,6 +16,16 @@ import Foundation
         let annotation=PhotoAnnotation(colors:[.orange,.purple],rejected:true)
         try PhotoMarkStorage.save(annotation,for:photo)
         try require(PhotoMarkStorage.load(photo)==annotation)
+        for file in photo.files {
+            let path = PhotoMarkStorage.url(file)
+            let record = try JSONDecoder().decode(PhotoMarkRecord.self, from: Data(contentsOf: path))
+            precondition(record.version == 3 && record.digest == nil)
+            let old = PhotoMarkRecord(version: 2, filename: record.filename, bytes: record.bytes,
+                                      digest: String(repeating: "0", count: 64), identity: record.identity,
+                                      modified: record.modified, annotation: annotation)
+            try JSONEncoder().encode(old).write(to: path)
+        }
+        try require(PhotoMarkStorage.load(photo) == annotation)
         try require(Data(contentsOf:j)==jBytes && Data(contentsOf:r)==rBytes)
         precondition(photo.files.allSatisfy{fm.fileExists(atPath:PhotoMarkStorage.url($0).path)})
         let moved=root.appendingPathComponent("Moved");try fm.createDirectory(at:moved,withIntermediateDirectories:true)
@@ -26,7 +36,7 @@ import Foundation
         let jpeg=photo.files.first{!$0.isRAW}!,rawFile=photo.files.first{$0.isRAW}!
         var replacement=jBytes;replacement[0]=UInt8(ascii:"X");try replacement.write(to:jpeg.url)
         photo=try LibraryService.scan(roots)[0]
-        try require(!PhotoMarkStorage.load(photo).rejected)
+        try require(PhotoMarkStorage.load(photo) == PhotoAnnotation())
         try jBytes.write(to:jpeg.url);photo=try LibraryService.scan(roots)[0]
         try PhotoMarkStorage.save(annotation,for:photo)
         let trash=root.appendingPathComponent("trash.JPG")
@@ -49,6 +59,13 @@ import Foundation
         for file in photo.files{try fm.removeItem(at:PhotoMarkStorage.url(file))}
         let migrated=try PhotoMarkStorage.load(photo,legacyRejected:true)
         precondition(migrated.rejected && photo.files.allSatisfy{fm.fileExists(atPath:PhotoMarkStorage.url($0).path)})
+        for file in photo.files {
+            let record = try JSONDecoder().decode(PhotoMarkRecord.self, from: Data(contentsOf: PhotoMarkStorage.url(file)))
+            precondition(record.digest == nil && record.identity == file.identity)
+        }
+        try fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 10)], ofItemAtPath: jpeg.url.path)
+        let changed = try LibraryService.scan(roots)[0]
+        try require(!PhotoMarkStorage.load(changed).rejected)
         try Data("broken".utf8).write(to:jpgMark)
         mustFail{_ = try PhotoMarkStorage.load(photo)}
         print("PASS symlink destination rejection with untouched paired record, legacy migration and corrupt-record rejection")

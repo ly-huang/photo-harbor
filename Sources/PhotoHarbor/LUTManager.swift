@@ -7,13 +7,13 @@ import UniformTypeIdentifiers
     static func show(directory: URL, kind: FilterLibraryKind? = nil) {
         let library=LUTLibrary.shared(directory:directory.appendingPathComponent("LUTs"))
         if let kind { library.selectedKind=kind }
-        if let existing = shared, existing.window != nil { existing.showWindow(nil); existing.window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        if let existing = shared, existing.window != nil { existing.showWindow(nil); existing.window?.makeKeyAndOrderFront(nil); NSApp.activate(); return }
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 500), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "滤镜 / LUT 管理"; window.minSize = NSSize(width: 420, height: 360); window.isReleasedWhenClosed = false
         window.appearance = NSAppearance(named: .darkAqua); window.titlebarAppearsTransparent = true
         let controller = LUTManagerController(window: window); window.delegate = controller
         window.contentView = NSHostingView(rootView: LUTManagerView(library: LUTLibrary.shared(directory: directory.appendingPathComponent("LUTs"))))
-        shared = controller; window.center(); controller.showWindow(nil); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        shared = controller; window.center(); controller.showWindow(nil); window.makeKeyAndOrderFront(nil); NSApp.activate()
     }
     func windowWillClose(_ notification: Notification) { Self.shared = nil }
 }

@@ -3,7 +3,7 @@ import AppKit
 
 struct PhotoExportView: View {
     let photos: [Photo]
-    let protected: Set<URL>
+    let protected: [PhotoFile]
     @Environment(\.dismiss) private var dismiss
     @ViewState private var folder: URL?
     @ViewState private var separate = true
@@ -17,8 +17,8 @@ struct PhotoExportView: View {
     private var files: [PhotoFile] { photos.flatMap(\.files) }
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text("导出筛选照片").font(.title2.weight(.semibold))
-            Text("当前筛选结果：\(photos.count) 张照片，\(files.count) 个文件。复制 JPG 与 RAW，保留来源文件。").foregroundStyle(.secondary)
+            Text("导出照片").font(.title2.weight(.semibold))
+            Text("\(photos.count) 张照片，\(files.count) 个文件。复制 JPG 与 RAW，保留来源文件。").foregroundStyle(.secondary)
             HStack {
                 Text(folder?.path ?? "请选择导出文件夹").lineLimit(2).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                 Button("选择…") { chooseFolder() }.disabled(running || finished)
@@ -54,6 +54,7 @@ struct PhotoExportView: View {
         guard let folder else { return }
         running = true
         defer { running = false; finished = true }
+        let protection = PhotoExport.Protection(files: protected)
         for file in files {
             if stopped { break }
             let destination = PhotoExport.destination(file, folder: folder, separate: separate)
@@ -65,17 +66,98 @@ struct PhotoExportView: View {
                     let alert = NSAlert(); alert.messageText = "已存在同名文件：\(destination.lastPathComponent)"
                     alert.informativeText = "目标：\(destination.path)\n替换会覆盖目标内容，无法通过应用撤销。来源照片保留。"
                     alert.addButton(withTitle: "保留两者"); alert.addButton(withTitle: "替换已有文件"); alert.addButton(withTitle: "跳过该文件")
-                    alert.buttons[1].isEnabled = target != nil && !protected.contains(destination)
+                    alert.buttons[1].isEnabled = target != nil && !protection.paths.contains(destination)
                     if let window = NSApp.keyWindow {
                         let response = await withCheckedContinuation { continuation in alert.beginSheetModal(for: window) { continuation.resume(returning: $0) } }
                         choice = response == .alertSecondButtonReturn ? .replace : response == .alertThirdButtonReturn ? .skip : .keepBoth
                     } else { choice = .skip }
                 }
-                let selectedChoice = choice, reviewed = target, protectedURLs = protected
-                let result = try await Task.detached(priority: .userInitiated) { try PhotoExport.copy(file, to: destination, choice: selectedChoice, target: reviewed, protected: protectedURLs) }.value
+                let selectedChoice = choice, reviewed = target
+                let result = try await Task.detached(priority: .userInitiated) { try PhotoExport.copy(file, to: destination, choice: selectedChoice, target: reviewed, protection: protection) }.value
                 if result == nil { skipped += 1 } else { completed += 1 }
             } catch { failures.append("\(file.url.lastPathComponent)：\(error.localizedDescription)") }
             processed += 1
+        }
+    }
+}
+
+enum PhotoContextAction: String, CaseIterable {
+    case export = "导出照片…"
+    case trash = "移入废纸篓…"
+    case delete = "直接删除…"
+}
+
+struct PhotoContextRequest: Identifiable {
+    let id = UUID()
+    let action: PhotoContextAction
+    let photos: [Photo]
+}
+
+struct PhotoFileActions: View {
+    @EnvironmentObject private var store: LibraryStore
+    let photos: [Photo]
+    let perform: (PhotoContextAction, [Photo]) -> Void
+
+    var body: some View {
+        if !store.editorActive {
+            ForEach(PhotoContextAction.allCases, id: \.self) { action in
+                Button(action.rawValue, role: action == .delete ? .destructive : nil) { perform(action, photos) }
+                    .disabled(store.busy || (action != .export && (!store.trusted || photos.contains(where: \.ambiguous))))
+            }
+        }
+    }
+}
+
+struct PhotoContextSheet: View {
+    @EnvironmentObject private var store: LibraryStore
+    @Environment(\.dismiss) private var dismiss
+    @ViewState private var started = false
+    @ViewState private var failure: String?
+    let request: PhotoContextRequest
+
+    var body: some View {
+        if request.action == .export {
+            PhotoExportView(photos: request.photos, protected: store.photos.flatMap(\.files))
+        } else {
+            let permanently = request.action == .delete
+            let title = permanently ? "直接删除" : "移入废纸篓"
+            VStack(alignment: .leading, spacing: 14) {
+                Text(title).font(.headline)
+                if let failure {
+                    ScrollView { Text(failure).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                        .frame(maxHeight: 160)
+                    Button("完成") { dismiss() }
+                } else if started {
+                    DeletionProgressContent(progress: store.deletionProgress)
+                } else {
+                    Text("将处理 \(request.photos.count) 张照片，共 \(request.photos.flatMap(\.files).count) 个文件，包含已配对的 JPG 和 RAW。")
+                    if permanently { Text("直接删除无法通过拾影撤销。").foregroundStyle(.secondary) }
+                    HStack {
+                        Spacer()
+                        Button("取消", role: .cancel) { dismiss() }
+                        Button(title, role: .destructive) {
+                            started = true
+                            store.deletePhotos(request.photos, permanently: permanently, completion: { error in
+                                if let error { failure = error } else { dismiss() }
+                            })
+                        }.disabled(!store.trusted || store.busy || store.editorActive)
+                    }
+                }
+            }.padding(24).frame(width: 390).interactiveDismissDisabled(started && failure == nil)
+        }
+    }
+}
+
+struct DeletionProgressContent: View {
+    let progress: LibraryStore.DeletionProgress?
+    var body: some View {
+        Text(progress?.stage ?? "正在核对照片及配对关系…").foregroundStyle(.secondary)
+        if let progress, let completed = progress.completed {
+            ProgressView(value: Double(completed), total: Double(progress.total)) {
+                Text("已处理 \(completed) / \(progress.total) 张照片")
+            }
+        } else {
+            ProgressView().progressViewStyle(.linear)
         }
     }
 }

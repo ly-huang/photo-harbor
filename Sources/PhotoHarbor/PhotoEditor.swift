@@ -85,18 +85,33 @@ actor PhotoEditEngine {
     private var thumbnailsKey: PhotoAdjustments?
     private var thumbnailsCache: [String:CGImage] = [:]
     private var cubeCache: [String: CubeLUT] = [:]
-    func open(_ url: URL) throws -> EditorInput {
-        let snapshot = try EditPersistence.snapshot(url)
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), CGImageSourceGetType(source) as String? == "public.jpeg",
+    func open(_ url: URL) async throws -> EditorInput {
+        let (bytes, snapshot) = try EditPersistence.readSource(url)
+        guard let source = CGImageSourceCreateWithData(bytes as CFData, nil), CGImageSourceGetType(source) as String? == "public.jpeg",
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: 1800] as CFDictionary) else { throw LibraryError.message("无法解码 JPG。") }
         let input = CIImage(cgImage: image)
-        if let detector = CIDetector(ofType: CIDetectorTypeFace, context: context, options: [CIDetectorAccuracy: CIDetectorAccuracyLow]) {
-            faces = detector.features(in: input).map { CGRect(x: $0.bounds.minX / input.extent.width, y: $0.bounds.minY / input.extent.height, width: $0.bounds.width / input.extent.width, height: $0.bounds.height / input.extent.height) }
-        } else { faces = [] }
-        guard try EditPersistence.snapshot(url) == snapshot else { throw LibraryError.message("照片读取期间已变化。") }
+        let detectedFaces = await Self.detectFaces(in: image)
+        try Task.checkCancellation()
+        guard try EditPersistence.fileVersion(url) == snapshot.identity else { throw LibraryError.message("照片读取期间已变化。") }
+        faces = detectedFaces
         sourceURL = url; expected = snapshot; previewInput = input; referenceKey = nil; referenceCache = nil; thumbnailsKey = nil; thumbnailsCache = [:]; importedThumbnailKey=nil; importedThumbnailCache.removeAll();stripCache.removeAll()
         let backup = try EditPersistence.record(url, current: snapshot) != nil
         return EditorInput(image: image, snapshot: snapshot, hasBackup: backup, faces: faces.count)
+    }
+
+    private static func detectFaces(in image: CGImage) async -> [CGRect] {
+        // ImageIO already applied the JPEG orientation when creating this preview.
+        if #available(macOS 15.0, *) {
+            let request = DetectFaceRectanglesRequest()
+            return (try? await request.perform(on: image, orientation: .up))?.map(\.boundingBox.cgRect) ?? []
+        }
+        let request = VNDetectFaceRectanglesRequest()
+        do {
+            try VNImageRequestHandler(cgImage: image, orientation: .up).perform([request])
+            return request.results?.map(\.boundingBox) ?? []
+        } catch {
+            return []
+        }
     }
     private func cube(_ entry: LUTEntry?, directory: URL) throws -> CubeLUT? {
         guard let entry else { return nil }
@@ -113,8 +128,9 @@ actor PhotoEditEngine {
     }
     func save(_ adjustments: PhotoAdjustments, lut: LUTEntry?, directory: URL, preset: ImportedPhotoFilter? = nil) throws {
         guard let url = sourceURL, let expected else { throw LibraryError.message("照片尚未加载。") }
-        guard try EditPersistence.snapshot(url) == expected else { throw LibraryError.message("照片已在其他程序修改，请重新打开编辑。") }
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw LibraryError.message("无法读取完整 JPG。") }
+        let (sourceBytes, sourceSnapshot) = try EditPersistence.readSource(url)
+        guard sourceSnapshot == expected else { throw LibraryError.message("照片已在其他程序修改，请重新打开编辑。") }
+        guard let source = CGImageSourceCreateWithData(sourceBytes as CFData, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw LibraryError.message("无法读取完整 JPG。") }
         var properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] ?? [:]
         let orientation = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
         let input = CIImage(cgImage: image).oriented(forExifOrientation: orientation)
@@ -135,7 +151,7 @@ actor PhotoEditEngine {
         guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { throw LibraryError.message("无法创建 JPG 输出。") }
         CGImageDestinationAddImage(destination, rendered, properties as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw LibraryError.message("无法编码 JPG。") }
-        self.expected = try EditPersistence.save(data as Data, to: url, expected: expected)
+        self.expected = try EditPersistence.save(data as Data, to: url, expected: expected, renderedFrom: sourceSnapshot)
     }
     func restore() throws {
         guard let url = sourceURL, let expected else { throw LibraryError.message("照片尚未加载。") }
@@ -170,19 +186,23 @@ actor PhotoEditEngine {
         }
         return a
     }
-    func recommendedCrop(_ a: PhotoAdjustments) throws -> (CGRect, Bool) {
+    func recommendedCrop(_ a: PhotoAdjustments) async throws -> (CGRect, Bool) {
         guard let input = previewInput else { throw LibraryError.message("照片尚未加载。") }
         var geometry=a;geometry.cropRect=nil;geometry.crop="原比例"
         let oriented=ImageGeometryPlan(size:input.extent.size,adjustments:geometry).apply(input)
         guard let image = context.createCGImage(oriented, from: oriented.extent) else { throw LibraryError.message("无法读取构图预览。") }
-        let request = VNGenerateAttentionBasedSaliencyImageRequest()
-        var subject: CGRect?
-        if (try? VNImageRequestHandler(cgImage: image).perform([request])) != nil {
-            let bounds = request.results?.first?.salientObjects?.map(\.boundingBox)
-            if let union = bounds?.reduce(CGRect.null, { $0.union($1) }), !union.isNull {
-                subject = CGRect(x: union.minX, y: 1 - union.maxY, width: union.width, height: union.height)
-            }
+        let bounds: [CGRect]
+        if #available(macOS 15.0, *) {
+            let observation = try? await GenerateAttentionBasedSaliencyImageRequest().perform(on: image)
+            bounds = observation?.salientObjects.map(\.boundingBox.cgRect) ?? []
+        } else {
+            let request = VNGenerateAttentionBasedSaliencyImageRequest()
+            if (try? VNImageRequestHandler(cgImage: image).perform([request])) != nil {
+                bounds = request.results?.first?.salientObjects?.map(\.boundingBox) ?? []
+            } else { bounds = [] }
         }
+        let union = bounds.reduce(CGRect.null) { $0.union($1) }
+        let subject = union.isNull ? nil : CGRect(x: union.minX, y: 1 - union.maxY, width: union.width, height: union.height)
         return (EditorGeometry.recommendation(subject: subject, size: oriented.extent.size), subject != nil)
     }
     private func blend(_ original: CIImage, _ effect: CIImage, amount: Double) -> CIImage {

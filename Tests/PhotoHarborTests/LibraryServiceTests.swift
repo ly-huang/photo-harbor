@@ -23,11 +23,23 @@ final class LibraryServiceTests: XCTestCase {
         let renamed = try PhotoExport.copy(item, to: dest, protected: protected)!
         XCTAssertEqual(renamed.lastPathComponent, "A (2).JPG")
         XCTAssertEqual(try String(contentsOf: dest, encoding: .utf8), "old")
-        _ = try PhotoExport.copy(item, to: dest, choice: .replace, target: reviewed, protected: protected)
+        let previousDate = try FileManager.default.attributesOfItem(atPath: dest.path)[.modificationDate] as! Date
+        try Data("new".utf8).write(to: dest)
+        try FileManager.default.setAttributes([.modificationDate: previousDate], ofItemAtPath: dest.path)
+        XCTAssertThrowsError(try PhotoExport.copy(item, to: dest, choice: .replace, target: reviewed, protected: protected))
+        XCTAssertEqual(try String(contentsOf: dest, encoding: .utf8), "new")
+        let reviewedAgain = try PhotoExport.reviewedTarget(dest)
+        _ = try PhotoExport.copy(item, to: dest, choice: .replace, target: reviewedAgain, protected: protected)
         XCTAssertEqual(try Data(contentsOf: dest), try Data(contentsOf: jpg))
         XCTAssertThrowsError(try PhotoExport.copy(item, to: dest, choice: .replace, target: reviewed, protected: protected))
         let own = try PhotoExport.reviewedTarget(jpg)
         XCTAssertThrowsError(try PhotoExport.copy(item, to: jpg, choice: .replace, target: own, protected: protected))
+        let hardLink = output.appendingPathComponent("linked-source.JPG")
+        try FileManager.default.linkItem(at: jpg, to: hardLink)
+        let reviewedLink = try PhotoExport.reviewedTarget(hardLink)
+        let protection = PhotoExport.Protection(files: files)
+        XCTAssertThrowsError(try PhotoExport.copy(item, to: hardLink, choice: .replace, target: reviewedLink, protection: protection))
+        XCTAssertEqual(try Data(contentsOf: hardLink), try Data(contentsOf: jpg))
         let link = base.appendingPathComponent("link")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: output)
         XCTAssertThrowsError(try PhotoExport.copy(item, to: link.appendingPathComponent("A.JPG"), protected: protected))
@@ -85,6 +97,11 @@ final class LibraryServiceTests: XCTestCase {
         _ = try file("raw/a/A.ARW")
         XCTAssertThrowsError(try LibraryService.validateDeletion(initial, roots: roots))
         let paired = try LibraryService.scan(roots)
+        _ = try file("jpg/unrelated/A.JPG")
+        try LibraryService.validateDeletion(paired, roots: roots)
+        _ = try file("jpg/a/A.jpeg")
+        XCTAssertThrowsError(try LibraryService.validateDeletion(paired, roots: roots))
+        try FileManager.default.removeItem(at: base.appendingPathComponent("jpg/a/A.jpeg"))
         _ = try file("jpg/a/A.JPG", content: "changed content")
         XCTAssertThrowsError(try LibraryService.validateDeletion(paired, roots: roots))
     }
@@ -120,6 +137,16 @@ final class LibraryServiceTests: XCTestCase {
         try Data("new source".utf8).write(to: jpg)
         let jpgItem = replacement.first { $0.source == jpg }!
         let rawItem = replacement.first { $0.source == raw }!
+        let originalBytes = try Data(contentsOf: rawItem.destination)
+        guard let originalDate = try FileManager.default.attributesOfItem(atPath: rawItem.destination.path)[.modificationDate] as? Date else {
+            throw LibraryError.message("测试文件缺少修改时间。")
+        }
+        var modifiedBytes = originalBytes
+        modifiedBytes[0] ^= 1
+        try modifiedBytes.write(to: rawItem.destination)
+        try FileManager.default.setAttributes([.modificationDate: originalDate], ofItemAtPath: rawItem.destination.path)
+        XCTAssertThrowsError(try LibraryService.copyVerified(rawItem))
+        XCTAssertEqual(try Data(contentsOf: rawItem.destination), modifiedBytes)
         try Data("changed destination".utf8).write(to: rawItem.destination)
         XCTAssertThrowsError(try LibraryService.copyVerified(rawItem))
         XCTAssertEqual(try String(contentsOf: rawItem.destination, encoding: .utf8), "changed destination")

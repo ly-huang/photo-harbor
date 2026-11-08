@@ -63,11 +63,14 @@ struct InteractivePhoto: NSViewRepresentable {
     var contextMarkAction:(()->Void)?=nil
     var rejected = false
     var navigatorTopInset: CGFloat = 0
+    var fileAction: ((PhotoContextAction) -> Void)? = nil
+    var canDelete = false
     let previous: () -> Void
     let next: () -> Void
     let mark: () -> Void
     func makeNSView(context: Context) -> PhotoCanvas { PhotoCanvas() }
     func updateNSView(_ view: PhotoCanvas, context: Context) {
+        view.fileAction = fileAction; view.canDelete = canDelete
         view.previous = previous; view.next = next; view.mark = mark
         view.evaluate = evaluate; view.showInfo = showInfo; view.activated = activated
         view.labels=labels;view.labelChanged=labelChanged;view.contextMarkAction=contextMarkAction
@@ -127,6 +130,8 @@ final class PhotoCanvas: NSView {
     var labels:Set<PhotoLabel>=[]
     var labelChanged:((PhotoLabel?)->Void)?
     var contextMarkAction:(()->Void)?
+    var fileAction: ((PhotoContextAction) -> Void)?
+    var canDelete = false
     var rejected = false
     var navigatorTopInset: CGFloat = 0
     var url: URL?
@@ -353,7 +358,18 @@ if labelChanged != nil {
         }
         add(rejected ? "取消待删除" : "标记待删除", #selector(contextMark))
         add(navigatorVisible ? "隐藏导航预览" : "显示导航预览", #selector(contextNavigator))
+        if fileAction != nil {
+            menu.addItem(.separator())
+            for action in PhotoContextAction.allCases where action == .export || canDelete {
+                let item = NSMenuItem(title: action.rawValue, action: #selector(contextFileAction(_:)), keyEquivalent: "")
+                item.target = self
+                menu.addItem(item)
+            }
+        }
         return menu
+    }
+    @objc private func contextFileAction(_ item: NSMenuItem) {
+        if let action = PhotoContextAction(rawValue: item.title) { fileAction?(action) }
     }
     @objc private func contextLabel(_ item:NSMenuItem){labelChanged?(item.tag>=0 ? PhotoLabel.allCases[item.tag]:nil)}
     @objc private func contextFit() { fit() }
