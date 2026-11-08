@@ -4,6 +4,7 @@ import AppKit
 @MainActor final class LibraryStore: ObservableObject {
     @Published var state = SavedState() {
         didSet {
+            if oldValue.rejected != state.rejected { rejectedCache = nil }
             if (filter == "待删除" && oldValue.rejected != state.rejected) ||
                 (!search.isEmpty && oldValue.albums != state.albums) { visibleCache = nil }
         }
@@ -11,11 +12,14 @@ import AppKit
     @Published var photos: [Photo] = [] {
         didSet {
             visibleCache = nil
+            rejectedCache = nil
+            photosByID = Dictionary(photos.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             albumCounts = photos.reduce(into: [:]) { $0[$1.albumID, default: 0] += 1 }
             unpairedCount = photos.count { !$0.paired }
             ambiguousCount = photos.count { $0.ambiguous }
         }
     }
+    private var photosByID: [String: Photo] = [:]
     private(set) var albumCounts: [String: Int] = [:]
     private(set) var unpairedCount = 0
     private(set) var ambiguousCount = 0
@@ -62,12 +66,11 @@ import AppKit
     @Published private(set) var deletionProgress: DeletionProgress?
     @Published var confirmTrash = false
     @Published var history = false
-    @Published var metadata = Metadata()
     @Published private(set) var importProgress: Double?
     @Published var cancellationRequested = false
     var viewerController: PhotoViewerController?
     var comparisonController: ComparisonController?
-    var comparisonPhotos: [Photo] { comparisonSelection.compactMap { id in photos.first { $0.id == id } } }
+    var comparisonPhotos: [Photo] { comparisonSelection.compactMap { photosByID[$0] } }
     func toggleComparison(_ photo: Photo) {
         if comparisonSelection.contains(photo.id) { comparisonSelection.removeAll { $0 == photo.id } }
         else {
@@ -105,12 +108,20 @@ import AppKit
         window.collectionBehavior = behavior
     }
     let stateURL: URL
-    var focused: Photo? { photos.first { $0.id == selected } }
+    var focused: Photo? { selected.flatMap { photosByID[$0] } }
     var albums: [OpenAlbum] { state.albums }
     var albumTitle: String? { albums.first { $0.id == album }?.title }
+    private var rejectedCache: [Photo]?
     var rejected: [Photo] {
         guard !state.rejected.isEmpty else { return [] }
-        return photos.filter { state.rejected.contains($0.id) && (album == nil || $0.albumID == album) && (labelFilter == nil || labels(for:$0).contains(labelFilter!)) } }
+        let marked = rejectedCache ?? photos.filter { state.rejected.contains($0.id) }
+        rejectedCache = marked
+        guard album != nil || labelFilter != nil else { return marked }
+        return marked.filter { photo in
+            (album == nil || photo.albumID == album) &&
+                (labelFilter.map { labels(for: photo).contains($0) } ?? true)
+        }
+    }
     var undoBatches: [DeletionBatch] { state.deletionBatches.filter { (album == nil || $0.albumID == album) && !unavailable.contains($0.albumID) }.reversed() }
     private var visibleCache: (photos: [Photo], ids: [String])?
     var visibleIDs: [String] {
@@ -258,7 +269,7 @@ import AppKit
         }
         busy = false
     }
-    func select(_ photo: Photo) { selected = photo.id }
+    func select(_ photo: Photo) { if selected != photo.id { selected = photo.id } }
     func reconcileSelection() {
         let ids = visibleIDs
         if let selected, ids.contains(selected) { return }
@@ -273,19 +284,19 @@ import AppKit
         cache.countLimit = 256
         return cache
     }()
-    func loadMetadata() async {
-        guard let photo = focused else { metadata = Metadata(); return }
-        let id = photo.id
-        if let cached = metadataCache.object(forKey: id as NSString) {
-            metadata = cached.value
-            return
-        }
-        metadata = Metadata()
+    func cachedMetadata(for photo: Photo) -> Metadata? {
+        metadataCache.object(forKey: photo.id as NSString)?.value
+    }
+    func loadMetadata(for photo: Photo) async -> Metadata? {
+        if let cached = cachedMetadata(for: photo) { return cached }
+        // Avoid starting a network read for each intermediate selection.
+        do { try await Task.sleep(for: .milliseconds(75)) }
+        catch { return nil }
         let result = await Task.detached { Metadata.readIfAvailable(photo.preview) }.value
         if let result {
-            metadataCache.setObject(CachedMetadata(result), forKey: id as NSString)
+            metadataCache.setObject(CachedMetadata(result), forKey: photo.id as NSString)
         }
-        if !Task.isCancelled, selected == id { metadata = result ?? Metadata() }
+        return result
     }
     func labels(for photo:Photo)->Set<PhotoLabel>{annotations[photo.id]?.colors ?? []}
     func toggleLabel(_ label:PhotoLabel,photo:Photo){var a=annotations[photo.id] ?? PhotoAnnotation(rejected:state.rejected.contains(photo.id));if a.colors.contains(label){a.colors.remove(label)}else{a.colors.insert(label)};writeAnnotation(a,photo:photo)}

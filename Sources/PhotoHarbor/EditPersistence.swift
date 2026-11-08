@@ -5,7 +5,17 @@ import Darwin
 
 struct EditSnapshot: Equatable, Sendable {
     let digest: String
+    let version: EditFileVersion
+
+    func matchesFile(_ other: EditSnapshot) -> Bool {
+        version.identity == other.version.identity && digest == other.digest
+    }
+}
+
+struct EditFileVersion: Equatable, Sendable {
     let identity: String
+    let changeSeconds: Int
+    let changeNanoseconds: Int
 }
 
 struct EditBackupRecord: Codable {
@@ -31,7 +41,7 @@ enum EditPersistence {
             path = (path as NSString).deletingLastPathComponent
         }
     }
-    static func fileVersion(_ url: URL) throws -> String {
+    static func fileVersion(_ url: URL) throws -> EditFileVersion {
         guard ["jpg", "jpeg"].contains(url.pathExtension.lowercased()) else { throw LibraryError.message("本版仅支持覆盖编辑 JPG。") }
         return version(try fileInfo(url))
     }
@@ -47,23 +57,28 @@ enum EditPersistence {
         let modified = info.st_mtimespec
         return "\(info.st_dev)|\(info.st_ino)|\(info.st_size)|\(modified.tv_sec)|\(modified.tv_nsec)"
     }
-    private static func version(_ info: stat) -> String {
+    private static func version(_ info: stat) -> EditFileVersion {
         let changed = info.st_ctimespec
-        return "\(renameIdentity(info))|\(changed.tv_sec)|\(changed.tv_nsec)"
+        return EditFileVersion(identity: renameIdentity(info), changeSeconds: changed.tv_sec, changeNanoseconds: changed.tv_nsec)
     }
     static func snapshot(_ url: URL) throws -> EditSnapshot {
         let version = try fileVersion(url)
         let digest = try hash(url)
         guard try fileVersion(url) == version else { throw LibraryError.message("读取期间照片已变化，请重新打开编辑。") }
-        return EditSnapshot(digest: digest, identity: version)
+        return EditSnapshot(digest: digest, version: version)
     }
     static func readSource(_ url: URL) throws -> (Data, EditSnapshot) {
         let version = try fileVersion(url)
         let data = try Data(contentsOf: url)
         let digest = hash(data)
         guard try fileVersion(url) == version else { throw LibraryError.message("读取期间照片已变化，请重新打开编辑。") }
-        return (data, EditSnapshot(digest: digest, identity: version))
+        return (data, EditSnapshot(digest: digest, version: version))
     }
+    static func stillMatches(_ url: URL, observed: EditSnapshot) throws -> Bool {
+        if try fileVersion(url) == observed.version { return true }
+        return try snapshot(url).matchesFile(observed)
+    }
+
     static func backupURL(_ url: URL) -> URL {
         url.deletingLastPathComponent().appendingPathComponent(".photoharbor-originals", isDirectory: true)
             .appendingPathComponent(hash(Data(url.lastPathComponent.utf8)) + ".jpg")
@@ -100,7 +115,7 @@ enum EditPersistence {
     @discardableResult static func save(_ data: Data, to url: URL, expected: EditSnapshot, renderedFrom source: EditSnapshot? = nil) throws -> EditSnapshot {
         try validateJPEG(data)
         let current = try source ?? snapshot(url)
-        guard current == expected, try fileVersion(url) == expected.identity else {
+        guard current.matchesFile(expected), try stillMatches(url, observed: current) else {
             throw LibraryError.message("照片已在外部修改，请重新打开编辑。")
         }
         let backup = backupURL(url), directory = backup.deletingLastPathComponent()
@@ -118,7 +133,7 @@ enum EditPersistence {
         return try publish(data, to: url, expected: expected, record: &manifest)
     }
     @discardableResult static func restore(_ url: URL, expected: EditSnapshot) throws -> EditSnapshot {
-        guard try snapshot(url) == expected else { throw LibraryError.message("照片已在外部修改，无法还原。") }
+        guard try snapshot(url).matchesFile(expected) else { throw LibraryError.message("照片已在外部修改，无法还原。") }
         guard var manifest = try readRecord(url, current: expected) else { throw LibraryError.message("还没有原图备份。") }
         let data = try Data(contentsOf: backupURL(url))
         guard hash(data) == manifest.originalDigest else {
@@ -127,6 +142,20 @@ enum EditPersistence {
         try validateJPEG(data)
         return try publish(data, to: url, expected: expected, record: &manifest)
     }
+    static func verifyStaged(_ url: URL, original: stat, digest: String) throws -> stat {
+        func matches(_ info: stat) -> Bool {
+            info.st_dev == original.st_dev && info.st_ino == original.st_ino && info.st_size == original.st_size
+        }
+        guard matches(try fileInfo(url)), try hash(url) == digest else {
+            throw LibraryError.message("编辑临时文件身份或内容已变化，操作已停止。")
+        }
+        let verified = try fileInfo(url)
+        guard matches(verified) else {
+            throw LibraryError.message("编辑临时文件身份已变化，操作已停止。")
+        }
+        return verified
+    }
+
     private static func publish(_ data: Data, to url: URL, expected: EditSnapshot, record: inout EditBackupRecord) throws -> EditSnapshot {
         let temporary = url.deletingLastPathComponent().appendingPathComponent(".photoharbor-edit-" + UUID().uuidString)
         defer { try? fm.removeItem(at: temporary) }
@@ -134,18 +163,20 @@ enum EditPersistence {
         let digest = hash(data)
         if let mode = try fm.attributesOfItem(atPath: url.path)[.posixPermissions] { try fm.setAttributes([.posixPermissions: mode], ofItemAtPath: temporary.path) }
         let staged = try fileInfo(temporary)
-        guard try hash(temporary) == digest else { throw LibraryError.message("编辑临时文件校验失败。") }
         record.pendingDigest = digest
         try writeRecord(record, for: url)
-        guard try snapshot(url) == expected else { throw LibraryError.message("保存前照片已变化，操作已停止。") }
-        guard version(try fileInfo(temporary)) == version(staged) else {
-            throw LibraryError.message("编辑临时文件已变化，操作已停止。")
+        let current = try snapshot(url)
+        guard current.matchesFile(expected) else { throw LibraryError.message("保存前照片已变化，操作已停止。") }
+        // A network share can report different timestamps after the staged write settles.
+        let verified = try verifyStaged(temporary, original: staged, digest: digest)
+        guard try stillMatches(url, observed: current) else {
+            throw LibraryError.message("保存前照片已变化，操作已停止。")
         }
         guard rename(temporary.path, url.path) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         let published = try fileInfo(url)
         let result: EditSnapshot
-        if staged.st_ino != 0, renameIdentity(staged) == renameIdentity(published) {
-            result = EditSnapshot(digest: digest, identity: version(published))
+        if verified.st_ino != 0, renameIdentity(verified) == renameIdentity(published) {
+            result = EditSnapshot(digest: digest, version: version(published))
         } else {
             result = try snapshot(url)
             guard result.digest == digest else { throw LibraryError.message("发布后的 JPG 已变化。") }

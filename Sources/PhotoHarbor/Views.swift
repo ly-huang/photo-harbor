@@ -89,7 +89,6 @@ struct LibraryView: View {
             Text("将关闭列表中的 \(store.albums.count) 个相册，并清除相关的废纸篓撤销记录。磁盘上的照片和标记会保留。")
         }
         .task { store.scanOnLaunch() }
-        .task(id: store.selected) { await store.loadMetadata() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in if !store.busy { store.refreshHistory() } }
         .onChange(of: store.visibleIDs) { _, ids in
             selectedIDs.formIntersection(ids)
@@ -300,11 +299,7 @@ struct LibraryView: View {
                 }
                 Label(photo.ambiguous ? "同名歧义，需人工检查" : photo.paired ? "JPG 与 ARW 已配对" : "仅找到一种格式", systemImage: photo.ambiguous ? "exclamationmark.triangle" : photo.paired ? "link" : "link.badge.plus").font(.caption).foregroundStyle(photo.ambiguous ? .orange : accent)
                 Divider()
-                info("拍摄时间", store.metadata.date?.formatted(date: .numeric, time: .standard) ?? "无拍摄时间信息")
-                info("相机", store.metadata.camera)
-                if !store.metadata.dimensions.isEmpty { info("尺寸", store.metadata.dimensions) }
-                if !store.metadata.exposure.isEmpty { info("光圈", store.metadata.exposure) }
-                if !store.metadata.gps.isEmpty { info("GPS", store.metadata.gps) }
+                PhotoMetadataRows(photo: photo, store: store)
                 info("文件总大小", readableBytes(photo.bytes))
                 Divider()
                 HStack {
@@ -333,9 +328,7 @@ struct LibraryView: View {
             }
         }.padding(18).frame(maxHeight: .infinity).background(panel)
     }
-    private func info(_ label: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) { Text(label).font(.caption2).foregroundStyle(.secondary); Text(value).font(.system(size: 12)).textSelection(.enabled).id(value) }
-    }
+
 }
 
 private struct AlbumSidebarList: View, Equatable {
@@ -420,6 +413,38 @@ private struct BatchPhotoActions: View {
     }
 }
 
+private func info(_ label: String, _ value: String) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+        Text(label).font(.caption2).foregroundStyle(.secondary)
+        Text(value).font(.system(size: 12)).textSelection(.enabled).id(value)
+    }
+}
+
+private struct PhotoMetadataRows: View {
+    let photo: Photo
+    let store: LibraryStore
+    private final class Details: ObservableObject {
+        @Published var metadata: Metadata?
+    }
+
+    @StateObject private var details = Details()
+
+    var body: some View {
+        let metadata = details.metadata ?? store.cachedMetadata(for: photo) ?? Metadata()
+        Group {
+            info("拍摄时间", metadata.date?.formatted(date: .numeric, time: .standard) ?? "无拍摄时间信息")
+            info("相机", metadata.camera)
+            if !metadata.dimensions.isEmpty { info("尺寸", metadata.dimensions) }
+            if !metadata.exposure.isEmpty { info("光圈", metadata.exposure) }
+            if !metadata.gps.isEmpty { info("GPS", metadata.gps) }
+        }
+        .task(id: photo.id) {
+            let result = await store.loadMetadata(for: photo)
+            if !Task.isCancelled { details.metadata = result }
+        }
+    }
+}
+
 private struct PhotoCard: View, Equatable {
     let store: LibraryStore
     let photo: Photo
@@ -481,16 +506,16 @@ private struct PhotoCard: View, Equatable {
         .background(isSelected ? accent.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 9))
         .overlay(RoundedRectangle(cornerRadius: 9).stroke(isSelected ? accent : .clear, lineWidth: 1.5))
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) {
-            guard !multipleSelection else { onToggleSelection(); return }
-            NSApp.keyWindow?.makeFirstResponder(nil); store.select(photo); store.showViewer()
-        }
-        .onTapGesture {
+        .simultaneousGesture(TapGesture().onEnded {
             NSApp.keyWindow?.makeFirstResponder(nil)
             if multipleSelection { onToggleSelection(); return }
             if NSEvent.modifierFlags.contains(.command) { store.toggleComparison(photo) }
             store.select(photo)
-        }
+        })
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            store.select(photo)
+            store.showViewer()
+        }, including: multipleSelection ? .none : .all)
         .contextMenu {
             PhotoCardMenu(photo: photo, batch: batch, onExport: onExport, onAction: onAction)
                 .environmentObject(store)
@@ -803,7 +828,7 @@ struct ViewerView: View {
                 if let photo = store.focused {
                     InteractivePhoto(url: photo.preview, fitToken: fitToken, fullScreen: store.viewerFullScreen,
                         navigatorVisible: store.navigatorVisible,
-                        evaluate: { evaluate(photo) }, showInfo: { info.reveal(); chrome.reveal() },
+                        evaluate: { evaluate(photo) },
                         toggleNavigator: { store.navigatorVisible.toggle() }, labels:store.labels(for:photo),labelChanged:{if let label=$0{store.toggleLabel(label,photo:photo)}else{store.clearLabels(photo)}}, rejected: store.state.rejected.contains(photo.id), navigatorTopInset: 60,
                         fileAction: store.editorActive || editingPhoto != nil || store.busy ? nil : {
                             photoAction = PhotoContextRequest(action: $0, photos: [photo])

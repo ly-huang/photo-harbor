@@ -55,7 +55,6 @@ struct InteractivePhoto: NSViewRepresentable {
     var cropChanged: ((CGRect) -> Void)? = nil
     var exit: (() -> Void)? = nil
     var evaluate: (() -> Void)? = nil
-    var showInfo: (() -> Void)? = nil
     var activated: (() -> Void)? = nil
     var toggleNavigator: (() -> Void)? = nil
     var labels:Set<PhotoLabel>=[]
@@ -72,7 +71,7 @@ struct InteractivePhoto: NSViewRepresentable {
     func updateNSView(_ view: PhotoCanvas, context: Context) {
         view.fileAction = fileAction; view.canDelete = canDelete
         view.previous = previous; view.next = next; view.mark = mark
-        view.evaluate = evaluate; view.showInfo = showInfo; view.activated = activated
+        view.evaluate = evaluate; view.activated = activated
         view.labels=labels;view.labelChanged=labelChanged;view.contextMarkAction=contextMarkAction
         view.toggleNavigator = toggleNavigator; view.rejected = rejected
         view.navigatorTopInset = navigatorTopInset
@@ -124,7 +123,6 @@ final class PhotoCanvas: NSView {
     var next: (() -> Void)?
     var mark: (() -> Void)?
     var evaluate: (() -> Void)?
-    var showInfo: (() -> Void)?
     var activated: (() -> Void)?
     var toggleNavigator: (() -> Void)?
     var labels:Set<PhotoLabel>=[]
@@ -346,7 +344,6 @@ final class PhotoCanvas: NSView {
         }
         add("适应窗口", #selector(contextFit))
         if evaluate != nil { add("评测此图片", #selector(contextEvaluate)) }
-        if showInfo != nil { add("查看评测信息", #selector(contextInfo)) }
         menu.addItem(.separator())
 if labelChanged != nil {
             let parent=NSMenuItem(title:"颜色标记",action:nil,keyEquivalent:""),submenu=NSMenu()
@@ -374,7 +371,6 @@ if labelChanged != nil {
     @objc private func contextLabel(_ item:NSMenuItem){labelChanged?(item.tag>=0 ? PhotoLabel.allCases[item.tag]:nil)}
     @objc private func contextFit() { fit() }
     @objc private func contextEvaluate() { evaluate?() }
-    @objc private func contextInfo() { showInfo?() }
     @objc private func contextMark() { if let contextMarkAction{contextMarkAction()}else{mark?()} }
     @objc private func contextNavigator() { if let toggleNavigator { toggleNavigator() } else { navigatorVisible.toggle() } }
     private func paintAt(_ point:CGPoint) {

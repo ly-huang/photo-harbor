@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import AppKit
 import ImageIO
 import CoreImage
@@ -34,7 +35,12 @@ import UniformTypeIdentifiers
         expectFailure { _ = try EditPersistence.save(blue, to: jpg, expected: initial) }
         try require(try Data(contentsOf: jpg) != blue)
         try original.write(to: jpg)
-        _ = try EditPersistence.save(blue, to: jpg, expected: EditPersistence.snapshot(jpg))
+        let beforeMetadataChange = try EditPersistence.snapshot(jpg)
+        try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: jpg.path)
+        let afterMetadataChange = try EditPersistence.snapshot(jpg)
+        precondition(beforeMetadataChange != afterMetadataChange)
+        precondition(beforeMetadataChange.digest == afterMetadataChange.digest)
+        _ = try EditPersistence.save(blue, to: jpg, expected: beforeMetadataChange, renderedFrom: afterMetadataChange)
         try require(try Data(contentsOf: jpg) == blue)
         _ = try EditPersistence.save(original, to: jpg, expected: EditPersistence.snapshot(jpg))
         _ = try EditPersistence.save(blue, to: jpg, expected: EditPersistence.snapshot(jpg))
@@ -42,6 +48,27 @@ import UniformTypeIdentifiers
         try require(try Data(contentsOf: jpg) == original)
         try require(try Data(contentsOf: raw) == rawData)
         print("PASS overwrite checks external changes, first backup survives repeated saves, exact restore and RAW retention")
+        let replaced = root.appendingPathComponent("replaced.JPG")
+        try original.write(to: replaced)
+        let beforeReplacement = try EditPersistence.snapshot(replaced)
+        try original.write(to: replaced, options: .atomic)
+        expectFailure { _ = try EditPersistence.save(blue, to: replaced, expected: beforeReplacement) }
+        try require(try Data(contentsOf: replaced) == original)
+        print("PASS metadata-only changes allow saving while a byte-identical replacement is rejected")
+        let staged = root.appendingPathComponent(".staged")
+        try blue.write(to: staged)
+        var stagedInfo = stat()
+        precondition(lstat(staged.path, &stagedInfo) == 0)
+        let stagedDigest = EditPersistence.hash(blue)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: staged.path)
+        _ = try EditPersistence.verifyStaged(staged, original: stagedInfo, digest: stagedDigest)
+        var altered = blue
+        altered[0] ^= 1
+        try altered.write(to: staged)
+        expectFailure { _ = try EditPersistence.verifyStaged(staged, original: stagedInfo, digest: stagedDigest) }
+        try blue.write(to: staged, options: .atomic)
+        expectFailure { _ = try EditPersistence.verifyStaged(staged, original: stagedInfo, digest: stagedDigest) }
+        print("PASS staged JPEG permits timestamp changes but rejects changed bytes or file replacement")
         let backup = EditPersistence.backupURL(jpg)
         try Data("corrupt".utf8).write(to: backup)
         expectFailure { _ = try EditPersistence.restore(jpg, expected: EditPersistence.snapshot(jpg)) }

@@ -89,7 +89,7 @@ struct ComparisonView: View {
     private func pane(_ photo: Photo, index: Int) -> some View {
         InteractivePhoto(url: photo.preview, fitToken: fitToken, fullScreen: store.comparisonFullScreen, navigatorVisible: store.navigatorVisible,
             evaluate: { activeIndex = index; store.assessPhoto(photo); info.reveal() },
-            showInfo: { activeIndex = index; info.reveal() }, activated: { if activeIndex != index { activeIndex = index } },
+            activated: { if activeIndex != index { activeIndex = index } },
             toggleNavigator: { store.navigatorVisible.toggle() }, labels:store.labels(for:photo),labelChanged:{if let label=$0{store.toggleLabel(label,photo:photo)}else{store.clearLabels(photo)}}, rejected: store.state.rejected.contains(photo.id), navigatorTopInset: 44,
             fileAction: store.editorActive || store.busy ? nil : {
                 photoAction = PhotoContextRequest(action: $0, photos: [photo])

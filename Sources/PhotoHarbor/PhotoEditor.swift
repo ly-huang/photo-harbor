@@ -92,7 +92,7 @@ actor PhotoEditEngine {
         let input = CIImage(cgImage: image)
         let detectedFaces = await Self.detectFaces(in: image)
         try Task.checkCancellation()
-        guard try EditPersistence.fileVersion(url) == snapshot.identity else { throw LibraryError.message("照片读取期间已变化。") }
+        guard try EditPersistence.stillMatches(url, observed: snapshot) else { throw LibraryError.message("照片读取期间已变化。") }
         faces = detectedFaces
         sourceURL = url; expected = snapshot; previewInput = input; referenceKey = nil; referenceCache = nil; thumbnailsKey = nil; thumbnailsCache = [:]; importedThumbnailKey=nil; importedThumbnailCache.removeAll();stripCache.removeAll()
         let backup = try EditPersistence.record(url, current: snapshot) != nil
@@ -129,7 +129,7 @@ actor PhotoEditEngine {
     func save(_ adjustments: PhotoAdjustments, lut: LUTEntry?, directory: URL, preset: ImportedPhotoFilter? = nil) throws {
         guard let url = sourceURL, let expected else { throw LibraryError.message("照片尚未加载。") }
         let (sourceBytes, sourceSnapshot) = try EditPersistence.readSource(url)
-        guard sourceSnapshot == expected else { throw LibraryError.message("照片已在其他程序修改，请重新打开编辑。") }
+        guard sourceSnapshot.matchesFile(expected) else { throw LibraryError.message("照片已在其他程序修改，请重新打开编辑。") }
         guard let source = CGImageSourceCreateWithData(sourceBytes as CFData, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw LibraryError.message("无法读取完整 JPG。") }
         var properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] ?? [:]
         let orientation = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
