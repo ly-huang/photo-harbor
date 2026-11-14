@@ -41,7 +41,7 @@ private actor ViewerRasterDecoder {
 
 /// Retains decoded rasters for the active viewer window.
 actor ViewerImageCache {
-    static let shared = ViewerImageCache()
+    static let shared = ViewerImageCache(maximumBytes: (UserDefaults.standard.object(forKey: "photo.viewerMiB") as? Int ?? 1024) * 1024 * 1024)
     private struct Entry {
         let signature: String
         let image: CGImage
@@ -63,7 +63,7 @@ actor ViewerImageCache {
     private var pending: [URL: PendingDecode] = [:]
     private let foregroundDecoder = ViewerRasterDecoder()
     private let backgroundDecoder = ViewerRasterDecoder()
-    private let maximumBytes: Int
+    private var maximumBytes: Int
     private let monitorsPressure: Bool
     private var pressureMonitor: ViewerMemoryPressureMonitor?
     private(set) var budget: Int
@@ -76,6 +76,13 @@ actor ViewerImageCache {
         self.maximumBytes = max(0, maximumBytes)
         self.budget = max(0, maximumBytes)
         self.monitorsPressure = monitorsPressure
+    }
+
+    func setMaximumBytes(_ value: Int) {
+        maximumBytes = max(0, value)
+        budget = pressureIsNormal ? maximumBytes : min(budget, maximumBytes)
+        for url in priority.reversed() where cost > budget { remove(url) }
+        if budget == 0 { cancelDecodes { _, decode in decode.prefetch } }
     }
 
     private func startPressureMonitor() {

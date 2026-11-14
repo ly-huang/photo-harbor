@@ -7,6 +7,9 @@ private let accent = Color(red: 0.51, green: 0.72, blue: 0.96)
 
 struct LibraryView: View {
     @EnvironmentObject var store: LibraryStore
+    @AppStorage("photo.sidebarWidth") private var sidebarWidth = 208.0
+    @Binding var inspectorVisible: Bool
+    @ViewState private var sidebarDragOffset: CGFloat = 0
     @ViewState private var thumbnailSize: Double = 210
     @ViewState private var showingSelection = false
     @ViewState private var exportPhotos: [Photo] = []
@@ -23,8 +26,16 @@ struct LibraryView: View {
     private var batchPhotos: [Photo] { store.visible.filter { selectedIDs.contains($0.id) } }
     var body: some View {
         HStack(spacing: 0) {
-            sidebar.frame(width: 208)
-            Divider()
+            sidebar.frame(width: resizedSidebarWidth(by: sidebarDragOffset))
+            LibrarySidebarDivider(
+                onDrag: { sidebarDragOffset = $0 },
+                onEnd: {
+                    sidebarWidth = resizedSidebarWidth(by: $0)
+                    sidebarDragOffset = 0
+                }
+            )
+            .overlay { Divider().allowsHitTesting(false) }
+            .frame(width: 7)
             VStack(spacing: 0) {
                 header
                 Divider()
@@ -38,7 +49,7 @@ struct LibraryView: View {
                 }
                 Divider()
                 HStack {
-                    if store.busy { ProgressView().controlSize(.small) }
+                    if store.busy && !store.storageTimedOut { ProgressView().controlSize(.small) }
                     Text(store.status).lineLimit(1).help(store.status)
                     Spacer()
                     if let progress = store.importProgress {
@@ -48,12 +59,15 @@ struct LibraryView: View {
                     Image(systemName: "internaldrive"); Text("本地照片库")
                 }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 20).frame(height: 38)
             }.background(canvas)
-            Divider()
-            inspector.frame(width: 248)
+            if inspectorVisible {
+                Divider()
+                inspector.frame(width: 248)
+            }
         }
         .tint(accent)
         .background(WindowTitleHider())
         .background(MainToolbar(store: store))
+        .background(PhotoShortcutMonitor(handle: handleShortcut))
         .sheet(isPresented: $store.settings) { SettingsView() }
         .sheet(isPresented: $store.importing) { ImportView() }
         .sheet(isPresented: $store.history) { DeletionHistoryView() }
@@ -94,6 +108,47 @@ struct LibraryView: View {
             selectedIDs.formIntersection(ids)
             store.reconcileSelection()
         }
+    }
+
+    private func resizedSidebarWidth(by offset: CGFloat) -> CGFloat {
+        min(320, max(168, CGFloat(sidebarWidth) + offset))
+    }
+
+    private func handleShortcut(_ event: NSEvent) -> Bool {
+        guard !(event.window?.firstResponder is NSTextView), !store.editorActive,
+              !store.settings, !store.importing, !store.history, photoAction == nil, !showingExport,
+              let command = event.photoCommand else { return false }
+        if event.isARepeat { return true }
+        if command == .albumFinder || command == .albumClose {
+            guard let album = store.albums.first(where: { $0.id == store.album }) else { return false }
+            if command == .albumFinder { NSWorkspace.shared.activateFileViewerSelecting(album.roots.urls) }
+            else { store.closeAlbum(album.id) }
+            return true
+        }
+        if command == .compare {
+            store.showComparison()
+            return true
+        }
+        let selection = multipleSelection ? batchPhotos : []
+        guard let photo = selection.first ?? store.focused else { return false }
+        let targets = selection.isEmpty ? [photo] : selection
+        if let action = command.fileAction {
+            guard !store.busy, action == .export || (store.trusted && !targets.contains(where: \.ambiguous)) else { return true }
+            photoAction = PhotoContextRequest(action: action, photos: targets)
+        } else if let label = command.label {
+            store.setLabel(label, enabled: !targets.allSatisfy { store.labels(for: $0).contains(label) }, for: targets)
+        } else {
+            switch command {
+            case .view: store.select(photo); store.showViewer()
+            case .comparisonAdd: store.toggleComparison(photo)
+            case .assess: store.assessPhoto(photo)
+            case .reject: store.setRejected(!targets.allSatisfy { store.state.rejected.contains($0.id) }, for: targets)
+            case .clearLabels: store.clearLabels(for: targets)
+            case .finder: NSWorkspace.shared.activateFileViewerSelecting(photo.files.map(\.url))
+            default: return false
+            }
+        }
+        return true
     }
 
     private var photoGrid: some View {
@@ -167,7 +222,7 @@ struct LibraryView: View {
             nav("全部照片", icon: "square.grid.2x2", count: store.photos.count)
             nav("未配对", icon: "link", count: store.unpairedCount)
             nav("待检查", icon: "exclamationmark.triangle", count: store.ambiguousCount)
-            nav("待删除", icon: "trash", count: store.rejected.count)
+            nav("待删除", icon: "trash", count: store.totalRejectedCount)
             HStack {
                 Text("拍摄相册")
                 Spacer()
@@ -181,9 +236,9 @@ struct LibraryView: View {
             }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 24).padding(.top, 30).padding(.bottom, 10)
             AlbumSidebarList(store: store, albums: store.albums, counts: store.albumCounts,
                              unavailable: store.unavailable, selected: store.album,
-                             reveal: store.importedAlbumReveal,
-                             blocked: store.busy && !store.scanningAlbums && !store.marking,
-                             canClose: (!store.busy || store.marking) && !store.editorActive)
+                             reveal: store.albumReveal,
+                             blocked: store.busy && !store.scanningAlbums && !store.marking && !store.storageTimedOut,
+                             canClose: !store.busy && !store.editorActive)
                 .equatable()
             Spacer(minLength: 16)
             VStack(alignment: .leading, spacing: 8) {
@@ -194,7 +249,15 @@ struct LibraryView: View {
     }
     private func nav(_ title: String, icon: String, count: Int) -> some View {
         Button { store.filter = title; store.album = nil } label: {
-            HStack { Image(systemName: icon).frame(width: 20); Text(title); Spacer(); Text("\(count)").font(.caption).foregroundStyle(.secondary) }
+            HStack {
+                Image(systemName: icon).frame(width: 20)
+                Text(title)
+                Spacer()
+                Text(count, format: .number)
+                    .font(.caption.monospacedDigit())
+                    .fixedSize()
+                    .foregroundStyle(.secondary)
+            }
                 .font(.system(size: 13)).padding(.horizontal, 12).padding(.vertical, 10)
                 .background(store.filter == title && store.album == nil ? accent.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 6))
                 .foregroundStyle(store.filter == title && store.album == nil ? accent : .primary)
@@ -205,6 +268,7 @@ struct LibraryView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .firstTextBaseline) {
                 Text(store.albumTitle ?? store.filter).font(.system(size: 25, weight: .semibold))
+                    .lineLimit(1)
                 Text("\(store.visible.count) 张").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("对比所选图片（\(store.comparisonPhotos.count)/4）") { store.showComparison() }.disabled(!(2...4).contains(store.comparisonPhotos.count)).help("按住 ⌘ 选择二至四张照片，或右键加入对比")
@@ -219,7 +283,26 @@ struct LibraryView: View {
                         })
                             .environmentObject(store)
                     }
-                if store.filter == "待删除" {
+                if let album = store.album {
+                    let targets = store.rejectedInAlbum(album)
+                    Menu {
+                        Button("移入废纸篓…") { photoAction = PhotoContextRequest(action: .trash, photos: targets) }
+                        Button("直接删除…", role: .destructive) { photoAction = PhotoContextRequest(action: .delete, photos: targets) }
+                    } label: {
+                        Label {
+                            Text(targets.count, format: .number)
+                                .monospacedDigit()
+                                .fixedSize()
+                        } icon: {
+                            Image(systemName: "trash")
+                        }
+                        .labelStyle(.titleAndIcon)
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .disabled(store.busy || !store.trusted || store.editorActive || targets.isEmpty)
+                    .accessibilityLabel("当前相册待删除 \(targets.count.formatted()) 张照片")
+                    .help("当前相册有 \(targets.count.formatted()) 张待删除照片")
+                } else if store.filter == "待删除" {
                     Menu("删除操作") {
                         Button("移入废纸篓") { store.confirmTrash = true }
                         Button("直接删除…", role: .destructive) { confirmDirectDelete = true }
@@ -253,8 +336,25 @@ struct LibraryView: View {
                 }
                 Image(systemName: "square.grid.3x3").foregroundStyle(.secondary)
                 Slider(value: $thumbnailSize, in: 150...320).frame(width: 90).help("缩略图大小")
+                inspectorToggle
             }
         }.padding(.horizontal, 24).padding(.vertical, 12)
+    }
+    private var inspectorToggle: some View {
+        let title = inspectorVisible ? "隐藏照片信息" : "显示照片信息"
+        return Button {
+            inspectorVisible.toggle()
+        } label: {
+            Image(systemName: "sidebar.right")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(inspectorVisible ? accent : Color.secondary)
+                .frame(width: 28, height: 26)
+                .background(inspectorVisible ? accent.opacity(0.16) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .help(title)
     }
     private var emptyState: some View {
         VStack(spacing: 22) {
@@ -341,6 +441,9 @@ private struct AlbumSidebarList: View, Equatable {
     let blocked: Bool
     let canClose: Bool
 
+    @Namespace private var albumSpace
+    @StateObject private var drag = AlbumDragState()
+
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.store === rhs.store && lhs.albums == rhs.albums && lhs.counts == rhs.counts &&
         lhs.unavailable == rhs.unavailable && lhs.selected == rhs.selected && lhs.reveal == rhs.reveal &&
@@ -352,31 +455,91 @@ private struct AlbumSidebarList: View, Equatable {
             ScrollView {
                 LazyVStack(spacing: 3) {
                     ForEach(albums) { album in
-                        let paths = [album.roots.jpg, album.roots.raw].filter { !$0.isEmpty }
-                        let urls = paths.map { URL(fileURLWithPath: $0, isDirectory: true) }
-                        Button {
-                            store.album = album.id; store.filter = "全部照片"
-                        } label: {
-                            HStack(alignment: .top, spacing: 9) { Image(systemName: unavailable.contains(album.id) ? "externaldrive.badge.exclamationmark" : "folder").foregroundStyle(accent); Text(album.title).lineLimit(2); Spacer(minLength: 0); Text("\(counts[album.id, default: 0])").font(.caption2).foregroundStyle(.secondary) }
-                                .font(.system(size: 12)).padding(.horizontal, 12).padding(.vertical, 9)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(selected == album.id ? accent.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 6))
-                                .contentShape(Rectangle())
-                        }.buttonStyle(.plain).disabled(blocked)
+                        albumRow(album)
                             .id(album.id)
-                            .help(paths.joined(separator: "\n"))
-                            .overlay {
-                                AlbumContextMenu(roots: urls, canClose: canClose) {
-                                    store.closeAlbum(album.id)
+                            .background {
+                                GeometryReader { proxy in
+                                    Color.clear.preference(key: SelectionFrames.self,
+                                        value: [album.id: proxy.frame(in: .named(albumSpace))])
                                 }
                             }
+                            .overlay {
+                                if drag.target == album.id && drag.source != album.id {
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .strokeBorder(accent, lineWidth: 1.5)
+                                        .allowsHitTesting(false)
+                                }
+                            }
+                            .opacity(drag.source == album.id ? 0.55 : 1)
+                            .simultaneousGesture(
+                                DragGesture(minimumDistance: 6, coordinateSpace: .named(albumSpace))
+                                    .onChanged { value in
+                                        drag.source = album.id
+                                        drag.target = dropTarget(at: value.location)
+                                    }
+                                    .onEnded { value in
+                                        defer { drag.reset() }
+                                        guard let target = dropTarget(at: value.location) else { return }
+                                        withAnimation(.easeInOut(duration: 0.18)) {
+                                            _ = store.moveAlbum(album.id, to: target)
+                                        }
+                                    },
+                                including: canClose && albums.count > 1 ? .all : .none
+                            )
                     }
                 }.padding(.horizontal, 12)
             }
+            .coordinateSpace(name: albumSpace)
+            .onPreferenceChange(SelectionFrames.self) { drag.frames = $0 }
+            .onChange(of: canClose) { if !canClose { drag.reset() } }
             .onChange(of: reveal) {
                 if let album = selected { proxy.scrollTo(album, anchor: .top) }
             }
         }
+    }
+
+    private func dropTarget(at point: CGPoint) -> String? {
+        if let row = drag.frames.first(where: { $0.value.contains(point) }) { return row.key }
+        return nil
+    }
+
+    private func albumRow(_ album: OpenAlbum) -> some View {
+        let paths = [album.roots.jpg, album.roots.raw].filter { !$0.isEmpty }
+        let urls = paths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        return Button {
+            store.album = album.id
+            store.filter = "全部照片"
+        } label: {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: unavailable.contains(album.id) ? "externaldrive.badge.exclamationmark" : "folder")
+                    .foregroundStyle(accent)
+                Text(album.title).lineLimit(2)
+                Spacer(minLength: 0)
+                Text("\(counts[album.id, default: 0])").font(.caption2).foregroundStyle(.secondary)
+            }
+            .font(.system(size: 12)).padding(.horizontal, 12).padding(.vertical, 9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected == album.id ? accent.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 6))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).disabled(blocked)
+        .help(paths.joined(separator: "\n"))
+        .overlay {
+            AlbumContextMenu(roots: urls, canClose: canClose) {
+                store.closeAlbum(album.id)
+            }
+        }
+    }
+}
+
+private final class AlbumDragState: ObservableObject {
+    var frames: [String: CGRect] = [:]
+    @Published var source: String?
+    @Published var target: String?
+
+    func reset() {
+        source = nil
+        target = nil
     }
 }
 
@@ -394,20 +557,20 @@ private struct BatchPhotoActions: View {
     var includeExport = true
     var body: some View {
         let allRejected = photos.allSatisfy { store.state.rejected.contains($0.id) }
-        Button(allRejected ? "取消所选照片的待删除标记" : "标记所选照片为待删除") {
+        Button(PhotoCommand.reject.menuTitle(allRejected ? "取消所选照片的待删除标记" : "标记所选照片为待删除")) {
             store.setRejected(!allRejected, for: photos)
         }.disabled(store.busy)
         Menu("所选照片的颜色标记") {
             ForEach(PhotoLabel.allCases, id: \.self) { label in
                 let allHaveLabel = photos.allSatisfy { store.labels(for: $0).contains(label) }
                 Button { store.setLabel(label, enabled: !allHaveLabel, for: photos) } label: {
-                    Label { Text(allHaveLabel ? "移除\(label.rawValue)" : "添加\(label.rawValue)") } icon: {
+                    Label { Text(PhotoCommand.color(label).menuTitle(allHaveLabel ? "移除\(label.rawValue)" : "添加\(label.rawValue)")) } icon: {
                         Image(nsImage: label.menuImage).renderingMode(.original)
                     }
                 }
             }
             Divider()
-            Button("移除所有颜色标记") { store.clearLabels(for: photos) }
+            Button(PhotoCommand.clearLabels.menuTitle("移除所有颜色标记")) { store.clearLabels(for: photos) }
         }.disabled(store.busy)
         if includeExport { Button("导出所选照片…") { export(photos) }.disabled(store.busy) }
     }
@@ -535,16 +698,16 @@ private struct PhotoCardMenu: View {
             BatchPhotoActions(photos: batch, export: onExport, includeExport: false)
             Divider()
         }
-        Button("查看大图") { store.select(photo); store.showViewer() }
-        Button(store.comparisonSelection.contains(photo.id) ? "移出对比" : "加入对比（最多四张）") { store.toggleComparison(photo) }
-        if store.comparisonSelection.contains(photo.id) { Button("对比所选图片") { store.showComparison() }.disabled(!(2...4).contains(store.comparisonPhotos.count)) }
-        Button("评测此图片") { store.assessPhoto(photo) }.disabled(store.assessing.contains(photo.id))
+        Button(PhotoCommand.view.menuTitle("查看大图")) { store.select(photo); store.showViewer() }
+        Button(PhotoCommand.comparisonAdd.menuTitle(store.comparisonSelection.contains(photo.id) ? "移出对比" : "加入对比（最多四张）")) { store.toggleComparison(photo) }.photoHint(.comparisonAdd)
+        if store.comparisonSelection.contains(photo.id) { Button(PhotoCommand.compare.menuTitle("对比所选图片")) { store.showComparison() }.disabled(!(2...4).contains(store.comparisonPhotos.count)) }
+        Button(PhotoCommand.assess.menuTitle("评测此图片")) { store.assessPhoto(photo) }.disabled(store.assessing.contains(photo.id))
         Divider()
         PhotoLabelMenu(photo:photo)
-        Button(store.state.rejected.contains(photo.id) ? "取消待删除" : "标记待删除") { store.toggleReject(photo) }.disabled(store.busy)
+        Button(PhotoCommand.reject.menuTitle(store.state.rejected.contains(photo.id) ? "取消待删除" : "标记待删除")) { store.toggleReject(photo) }.photoHint(.reject).disabled(store.busy)
         Divider()
         PhotoFileActions(photos: batch.isEmpty ? [photo] : batch, perform: onAction)
-        Button("在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting(photo.files.map(\.url)) }
+        Button(PhotoCommand.finder.menuTitle("在 Finder 中显示")) { NSWorkspace.shared.activateFileViewerSelecting(photo.files.map(\.url)) }
     }
 }
 
@@ -813,6 +976,7 @@ struct ImportView: View {
 struct ViewerView: View {
     @ViewState private var photoAction: PhotoContextRequest?
     @EnvironmentObject var store: LibraryStore
+    @StateObject private var albumTransition = AlbumTransitionState()
     @StateObject private var chrome = ChromeState()
     @ViewState private var fitToken = 0
     @StateObject private var info = InspectorState()
@@ -833,8 +997,8 @@ struct ViewerView: View {
                         fileAction: store.editorActive || editingPhoto != nil || store.busy ? nil : {
                             photoAction = PhotoContextRequest(action: $0, photos: [photo])
                         }, canDelete: store.trusted && !photo.ambiguous,
-                        previous: { store.navigate(-1) }, next: { store.navigate(1) },
-                        mark: { if let current = store.focused { store.toggleReject(current) } })
+                        previous: { navigate(.previous) }, next: { navigate(.next) },
+                        mark: { if let current = store.focused { store.toggleReject(current) } }, enableShortcuts: !store.editorActive && editingPhoto == nil)
                         .id(photo.id).frame(maxWidth: .infinity, maxHeight: .infinity)
                     if !chrome.visible && store.state.rejected.contains(photo.id) {
                         VStack { HStack { Spacer(); Image(systemName: "trash.fill").foregroundStyle(.white).padding(9).background(.red, in: Circle()) }; Spacer() }.padding(16).allowsHitTesting(false)
@@ -861,14 +1025,16 @@ struct ViewerView: View {
                     }.fixedSize(horizontal: true, vertical: false)
                     Spacer()
                     FloatingTools {
-                        Button { store.navigate(-1) } label: { Label("上一张", systemImage: "chevron.left") }.labelStyle(.iconOnly).help("上一张，←")
-                        Button { fitToken += 1 } label: { Label("适应窗口", systemImage: "arrow.down.right.and.arrow.up.left") }.help("适应窗口，F；也可右键当前照片")
+                        Button { navigate(.previous) } label: { Label("上一张", systemImage: "chevron.left") }
+                            .labelStyle(.iconOnly).help("上一张，←").disabled(store.viewerDestination(.previous) == nil)
+                        Button { fitToken += 1 } label: { Label("适应窗口", systemImage: "arrow.down.right.and.arrow.up.left") }.photoHint(.fit)
                         Divider().frame(height: 16)
                         if let photo = store.focused {
                             Button { store.toggleReject(photo) } label: { Label(store.state.rejected.contains(photo.id) ? "取消待删除" : "标记待删除", systemImage: "trash") }.foregroundStyle(store.state.rejected.contains(photo.id) ? .red : .primary).disabled(store.busy)
                         }
                         Divider().frame(height: 16)
-                        Button { store.navigate(1) } label: { Label("下一张", systemImage: "chevron.right") }.labelStyle(.iconOnly).help("下一张，→")
+                        Button { navigate(.next) } label: { Label("下一张", systemImage: "chevron.right") }
+                            .labelStyle(.iconOnly).help("下一张，→").disabled(store.viewerDestination(.next) == nil)
                     }.fixedSize()
                 }.padding(12).padding(.top, store.viewerFullScreen ? 0 : 28).opacity(chrome.visible ? 1 : 0).allowsHitTesting(chrome.visible).accessibilityHidden(!chrome.visible)
             }
@@ -894,6 +1060,15 @@ struct ViewerView: View {
         }
         .onDisappear { Task { await ViewerImageCache.shared.clear() } }
         .sheet(item: $photoAction) { PhotoContextSheet(request: $0).environmentObject(store) }
+        .alert("切换相册？", isPresented: Binding(
+            get: { albumTransition.target != nil },
+            set: { if !$0 { albumTransition.target = nil } }
+        ), presenting: albumTransition.target) { target in
+            Button("取消", role: .cancel) {}
+            Button("切换相册") { store.confirmViewerTransition(target) }
+        } message: { target in
+            Text("已到达当前相册的\(target.direction == .next ? "最后一张" : "第一张")，要切换到「\(target.album.title)」吗？")
+        }
         .overlay {
             if let photo = editingPhoto {
                 PhotoEditorView(photo: photo, directory: store.stateURL.deletingLastPathComponent()) { closeWindow in
@@ -903,6 +1078,18 @@ struct ViewerView: View {
             }
         }
 
+    }
+    private final class AlbumTransitionState: ObservableObject {
+        @Published var target: LibraryStore.ViewerAlbumTransition?
+    }
+
+    private func navigate(_ direction: LibraryStore.ViewerDirection) {
+        guard albumTransition.target == nil, editingPhoto == nil, photoAction == nil else { return }
+        switch store.viewerDestination(direction) {
+        case .photo(let photoID): store.selected = photoID
+        case .album(let target): albumTransition.target = target
+        case nil: break
+        }
     }
     private func evaluate(_ photo: Photo) { store.assessPhoto(photo); info.reveal(); chrome.reveal(); chrome.scheduleHide() }
 }

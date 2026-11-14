@@ -7,7 +7,8 @@ import Darwin
 struct LibraryService {
     static let manager = FileManager.default
     static func scanFiles(_ root: URL, extensions: Set<String>, includeIdentity: Bool = true,
-                          deletionKeys: Set<String>? = nil, fallbackStems: Set<String> = []) throws -> [PhotoFile] {
+                          deletionKeys: Set<String>? = nil, fallbackStems: Set<String> = [],
+                          deadline: ContinuousClock.Instant? = nil, didScanEntry: (() throws -> Void)? = nil) throws -> [PhotoFile] {
         let root = canonicalURL(root)
         var relevantDirectories: Set<String> = []
         if let deletionKeys, fallbackStems.isEmpty {
@@ -29,6 +30,8 @@ struct LibraryService {
         var files: [PhotoFile] = []
         for case let enumeratedURL as URL in iterator {
             try Task.checkCancellation()
+            try didScanEntry?()
+            if let deadline, ContinuousClock.now >= deadline { throw LibraryError.message("等待超时，已停止核对。") }
             let url = enumeratedURL
             let values = try url.resourceValues(forKeys: keys)
             if values.isSymbolicLink == true { iterator.skipDescendants(); continue }
@@ -584,11 +587,14 @@ struct LibraryService {
     static func copyVerified(_ item: ImportItem) throws {
         try publishVerifiedImport(prepareVerifiedImport(item))
     }
-    static func validateDeletion(_ photos: [Photo], roots: Roots) throws {
+    static func validateDeletion(_ photos: [Photo], roots: Roots, deadline: ContinuousClock.Instant? = nil,
+                                 didProgress: (() throws -> Void)? = nil) throws {
         try roots.validate()
+        try didProgress?()
         var exactKeys: Set<String> = []
         var fallbackStems: Set<String> = []
         for photo in photos {
+            if let deadline, ContinuousClock.now >= deadline { throw LibraryError.message("等待超时，已停止核对。") }
             guard !photo.ambiguous, let first = photo.files.first else {
                 throw LibraryError.message("照片配对存在歧义，请重新扫描后检查。")
             }
@@ -601,17 +607,19 @@ struct LibraryService {
         // Exact pairs take precedence over matches elsewhere. Fallback pairing
         // needs every candidate with the same stem, including exact pairs.
         let jpg = try roots.jpgURL.map {
-            try scanFiles($0, extensions: ["jpg", "jpeg"], deletionKeys: exactKeys, fallbackStems: fallbackStems)
+            try scanFiles($0, extensions: ["jpg", "jpeg"], deletionKeys: exactKeys, fallbackStems: fallbackStems, deadline: deadline, didScanEntry: didProgress)
         } ?? []
         let raw = try roots.rawURL.map {
-            try scanFiles($0, extensions: ["arw"], deletionKeys: exactKeys, fallbackStems: fallbackStems)
+            try scanFiles($0, extensions: ["arw"], deletionKeys: exactKeys, fallbackStems: fallbackStems, deadline: deadline, didScanEntry: didProgress)
         } ?? []
         let fresh = pair(jpg: jpg, raw: raw)
         let byID = Dictionary(uniqueKeysWithValues: fresh.map { ($0.id, $0) })
         for photo in photos {
+            if let deadline, ContinuousClock.now >= deadline { throw LibraryError.message("等待超时，已停止核对。") }
             guard !photo.ambiguous, let current = byID[photo.id], !current.ambiguous, Set(current.files) == Set(photo.files) else { throw LibraryError.message("文件或配对关系已变化：\(photo.name)。请重新扫描后检查。") }
             for file in photo.files {
                 guard canonicalURL(file.url).path == file.url.path else { throw LibraryError.message("文件路径已变为符号链接，停止删除。") }
+                try didProgress?()
             }
         }
     }
@@ -624,8 +632,11 @@ struct LibraryService {
         guard canonicalURL(file.url).path == file.url.path else { throw LibraryError.message("照片路径包含符号链接。") }
         try validateFileIdentity(file)
     }
-    static func deletePermanently(_ file: PhotoFile) throws {
+    static func deletePermanently(_ file: PhotoFile, deadline: ContinuousClock.Instant? = nil,
+                                  beforeRemoval: (() throws -> Void)? = nil) throws {
         try validateRemoval(file)
+        try beforeRemoval?()
+        if let deadline, ContinuousClock.now >= deadline { throw LibraryError.message("等待超时，未删除文件。") }
         guard unlink(file.url.path) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }

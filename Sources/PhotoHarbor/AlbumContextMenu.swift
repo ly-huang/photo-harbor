@@ -36,9 +36,11 @@ struct AlbumContextMenu: NSViewRepresentable {
             menu.autoenablesItems = false
             let reveal = NSMenuItem(title: "在 Finder 中显示", action: #selector(revealAlbum), keyEquivalent: "")
             reveal.target = self
+            PhotoCommand.albumFinder.shortcut.apply(to: reveal)
             menu.addItem(reveal)
             let closeItem = NSMenuItem(title: "关闭相册", action: #selector(closeAlbum), keyEquivalent: "")
             closeItem.target = self
+            PhotoCommand.albumClose.shortcut.apply(to: closeItem)
             closeItem.isEnabled = canClose
             closeItem.toolTip = "只从列表关闭相册，磁盘照片保留。"
             menu.addItem(closeItem)

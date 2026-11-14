@@ -115,12 +115,12 @@ enum PhotoMarkStorage {
         return PreparedMark(target: target, data: try JSONEncoder().encode(record), previous: previous?.data)
     }
 
-    static func save(_ annotation: PhotoAnnotation, for photo: Photo) throws {
+    static func save(_ annotation: PhotoAnnotation, for photo: Photo, deadline: ContinuousClock.Instant? = nil) throws {
         let date = Date()
-        try commit(photo, prepared: photo.files.map { try prepare(annotation, file: $0, date: date) })
+        try commit(photo, prepared: photo.files.map { try prepare(annotation, file: $0, date: date) }, deadline: deadline)
     }
 
-    static func savePair(_ annotation: PhotoAnnotation, for photo: Photo) async throws {
+    static func savePair(_ annotation: PhotoAnnotation, for photo: Photo, deadline: ContinuousClock.Instant? = nil) async throws {
         let date = Date()
         let prepared = try await withThrowingTaskGroup(of: PreparedMark.self) { group in
             for file in photo.files {
@@ -130,14 +130,17 @@ enum PhotoMarkStorage {
             for try await item in group { prepared.append(item) }
             return prepared
         }
-        try commit(photo, prepared: prepared)
+        try commit(photo, prepared: prepared, deadline: deadline)
     }
 
-    private static func commit(_ photo: Photo, prepared: [PreparedMark]) throws {
+    private static func commit(_ photo: Photo, prepared: [PreparedMark], deadline: ContinuousClock.Instant?) throws {
         for file in photo.files{try checkFile(file)}
         var committed:[(URL,Data?)]=[]
         do {
             for item in prepared {
+                if let deadline, ContinuousClock.now >= deadline {
+                    throw LibraryError.message("等待超时，未开始写入标记。")
+                }
                 let target = item.target
                 let folder = target.deletingLastPathComponent()
                 if !FileManager.default.fileExists(atPath: folder.path) {
@@ -145,6 +148,9 @@ enum PhotoMarkStorage {
                 }
                 try EditPersistence.rejectLinks(folder)
                 if FileManager.default.fileExists(atPath:target.path){try EditPersistence.rejectLinks(target)}
+                if let deadline, ContinuousClock.now >= deadline {
+                    throw LibraryError.message("等待超时，未开始写入标记。")
+                }
                 try item.data.write(to: target, options: .atomic)
                 committed.append((target, item.previous))
             }

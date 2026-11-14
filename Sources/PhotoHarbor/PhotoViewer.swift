@@ -67,9 +67,10 @@ struct InteractivePhoto: NSViewRepresentable {
     let previous: () -> Void
     let next: () -> Void
     let mark: () -> Void
+    var enableShortcuts = true
     func makeNSView(context: Context) -> PhotoCanvas { PhotoCanvas() }
     func updateNSView(_ view: PhotoCanvas, context: Context) {
-        view.fileAction = fileAction; view.canDelete = canDelete
+        view.fileAction = fileAction; view.canDelete = canDelete; view.enableShortcuts = enableShortcuts
         view.previous = previous; view.next = next; view.mark = mark
         view.evaluate = evaluate; view.activated = activated
         view.labels=labels;view.labelChanged=labelChanged;view.contextMarkAction=contextMarkAction
@@ -96,6 +97,7 @@ struct InteractivePhoto: NSViewRepresentable {
 }
 
 final class PhotoCanvas: NSView {
+    var enableShortcuts = true
     var exit: (() -> Void)?
     private var presented: CGImage?
     var comparisonImage: NSImage?
@@ -338,28 +340,29 @@ final class PhotoCanvas: NSView {
     override func menu(for event: NSEvent) -> NSMenu? {
         window?.makeFirstResponder(self); activated?()
         let menu = NSMenu()
-        func add(_ title: String, _ action: Selector) {
+        func add(_ title: String, _ action: Selector, _ command: PhotoCommand) {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-            item.target = self; menu.addItem(item)
+            item.target = self; command.shortcut.apply(to: item); menu.addItem(item)
         }
-        add("适应窗口", #selector(contextFit))
-        if evaluate != nil { add("评测此图片", #selector(contextEvaluate)) }
+        add("适应窗口", #selector(contextFit), .fit)
+        if evaluate != nil { add("评测此图片", #selector(contextEvaluate), .assess) }
         menu.addItem(.separator())
 if labelChanged != nil {
             let parent=NSMenuItem(title:"颜色标记",action:nil,keyEquivalent:""),submenu=NSMenu()
             for (i,label) in PhotoLabel.allCases.enumerated(){
                 let item=NSMenuItem(title:label.rawValue,action:#selector(contextLabel(_:)),keyEquivalent:"");item.target=self;item.tag=i;item.state=labels.contains(label) ? .on:.off
-                item.attributedTitle=label.menuTitle;submenu.addItem(item)
+                item.attributedTitle=label.menuTitle;PhotoCommand.color(label).shortcut.apply(to:item);submenu.addItem(item)
             }
-            submenu.addItem(.separator());let clear=NSMenuItem(title:"移除所有颜色标记",action:#selector(contextLabel(_:)),keyEquivalent:"");clear.target=self;clear.tag = -1;clear.isEnabled = !labels.isEmpty;submenu.addItem(clear);parent.submenu=submenu;menu.addItem(parent)
+            submenu.addItem(.separator());let clear=NSMenuItem(title:"移除所有颜色标记",action:#selector(contextLabel(_:)),keyEquivalent:"");clear.target=self;clear.tag = -1;PhotoCommand.clearLabels.shortcut.apply(to:clear);clear.isEnabled = !labels.isEmpty;submenu.addItem(clear);parent.submenu=submenu;menu.addItem(parent)
         }
-        add(rejected ? "取消待删除" : "标记待删除", #selector(contextMark))
-        add(navigatorVisible ? "隐藏导航预览" : "显示导航预览", #selector(contextNavigator))
+        add(rejected ? "取消待删除" : "标记待删除", #selector(contextMark), .reject)
+        add(navigatorVisible ? "隐藏导航预览" : "显示导航预览", #selector(contextNavigator), .navigator)
         if fileAction != nil {
             menu.addItem(.separator())
             for action in PhotoContextAction.allCases where action == .export || canDelete {
                 let item = NSMenuItem(title: action.rawValue, action: #selector(contextFileAction(_:)), keyEquivalent: "")
                 item.target = self
+                PhotoCommand(fileAction: action).shortcut.apply(to: item)
                 menu.addItem(item)
             }
         }
@@ -385,22 +388,35 @@ if labelChanged != nil {
         updateSplit(flags: event.modifierFlags, point: convert(window?.mouseLocationOutsideOfEventStream ?? .zero, from: nil))
     }
     override func keyDown(with event: NSEvent) {
-        let characters = event.charactersIgnoringModifiers?.lowercased()
-        if characters == "f", event.modifierFlags.intersection([.command, .control, .option]).isEmpty { fit(); return }
-        if characters == "0", event.modifierFlags.contains(.command) { fit(); return }
+        if let command = event.photoCommand, enableShortcuts,
+           performShortcut(command, repeated: event.isARepeat) { return }
         switch event.keyCode {
         case 49: spaceHeld = true; refreshPointer()
-        case 51, 117: if !event.isARepeat { mark?() }
         case 123: previous?()
         case 124: next?()
-        case 3: fit()
-        case 29 where event.modifierFlags.contains(.command): fit()
         case 53:
             if let exit { exit(); return }
             if window?.styleMask.contains(.fullScreen) == true { window?.toggleFullScreen(nil) }
             else { window?.close() }
         default: super.keyDown(with: event)
         }
+    }
+    private func performShortcut(_ command: PhotoCommand, repeated: Bool) -> Bool {
+        if let action = command.fileAction, let fileAction, action == .export || canDelete {
+            if !repeated { fileAction(action) }
+        } else if let label = command.label, let labelChanged {
+            if !repeated { labelChanged(label) }
+        } else {
+            switch command {
+            case .fit: if !repeated { contextFit() }
+            case .assess where evaluate != nil: if !repeated { contextEvaluate() }
+            case .reject: if !repeated { contextMark() }
+            case .navigator: if !repeated { contextNavigator() }
+            case .clearLabels where labelChanged != nil: if !repeated { labelChanged?(nil) }
+            default: return false
+            }
+        }
+        return true
     }
     override func keyUp(with event: NSEvent) { if event.keyCode == 49 { spaceHeld = false; refreshPointer() } else { super.keyUp(with: event) } }
     override func scrollWheel(with event: NSEvent) {

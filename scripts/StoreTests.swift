@@ -53,6 +53,136 @@ import AppKit
         try store.applyRoots(Roots(raw: b.deletingLastPathComponent().path), title: "第二本")
         try await wait(store)
         let second = store.state.albums[1]
+        let third = OpenAlbum(roots: Roots(), title: "第三本")
+        let ordering = LibraryStore(stateURL: base.appendingPathComponent("album-order.json"))
+        ordering.state.albums = [first, second, third]
+        ordering.album = first.id
+        precondition(ordering.moveAlbum(third.id, to: second.id))
+        precondition(ordering.albums.map(\.id) == [first.id, third.id, second.id])
+        precondition(ordering.album == first.id)
+        let persistedOrder = LibraryStore(stateURL: ordering.stateURL)
+        precondition(persistedOrder.albums.map(\.id) == ordering.albums.map(\.id))
+        ordering.closeAlbum(first.id)
+        precondition(ordering.album == third.id)
+        ordering.album = second.id
+        ordering.closeAlbum(second.id)
+        precondition(ordering.album == third.id)
+        ordering.closeAlbum(third.id)
+        precondition(ordering.album == nil && ordering.albums.isEmpty)
+
+        persistedOrder.album = first.id
+        persistedOrder.closeAlbum(third.id)
+        precondition(persistedOrder.album == first.id)
+
+        let unwritable = LibraryStore(stateURL: base.appendingPathComponent("blocked-state"))
+        unwritable.state.albums = [first, second]
+        unwritable.album = first.id
+        try FileManager.default.createDirectory(at: unwritable.stateURL, withIntermediateDirectories: false)
+        precondition(!unwritable.moveAlbum(first.id, to: second.id))
+        unwritable.closeAlbum(first.id)
+        precondition(unwritable.albums == [first, second] && unwritable.album == first.id)
+        print("PASS album order persists, close selects the next row and wraps, and failed writes preserve the current state")
+        let browsing = LibraryStore(stateURL: base.appendingPathComponent("viewer-order.json"))
+        let emptyAlbum = OpenAlbum(roots: Roots(), title: "空相册")
+        browsing.state.albums = [first, emptyAlbum, second]
+        let firstPhoto = store.photos.first { $0.preview == a }!
+        let lastPhoto = store.photos.first { $0.preview == b }!
+        let extraFile = PhotoFile(url: addedWhileOpen, relative: addedWhileOpen.lastPathComponent,
+                                  bytes: 7, modified: Date(), identity: "viewer-fixture")
+        browsing.photos = [firstPhoto, Photo(files: [extraFile], albumID: first.id), lastPhoto]
+        let lastInFirst = browsing.photos[1]
+        browsing.album = first.id
+        browsing.selected = firstPhoto.id
+        precondition(browsing.viewerDestination(.previous) == nil)
+        guard case .photo(let nextID) = browsing.viewerDestination(.next) else {
+            preconditionFailure("Expected next photo in the same album")
+        }
+        precondition(nextID == lastInFirst.id)
+        browsing.selected = lastInFirst.id
+        guard case .album(let forward) = browsing.viewerDestination(.next) else {
+            preconditionFailure("Expected a confirmation for the next nonempty album")
+        }
+        precondition(forward.album.id == second.id && browsing.album == first.id)
+        browsing.confirmViewerTransition(forward)
+        precondition(browsing.album == second.id && browsing.selected == lastPhoto.id)
+        precondition(browsing.viewerDestination(.next) == nil)
+        guard case .album(let backward) = browsing.viewerDestination(.previous) else {
+            preconditionFailure("Expected a confirmation for the previous album")
+        }
+        browsing.confirmViewerTransition(backward)
+        precondition(browsing.album == first.id && browsing.selected == lastInFirst.id)
+        browsing.selected = firstPhoto.id
+        browsing.confirmViewerTransition(forward)
+        precondition(browsing.album == first.id)
+        print("PASS viewer album confirmation, empty album skipping, first/last boundaries and stale confirmation protection")
+        let markedFirst = store.photos.first { $0.preview == a }!
+        let markedSecond = store.photos.first { $0.preview == b }!
+        do {
+            try await PhotoMarkStorage.savePair(PhotoAnnotation(rejected: true), for: markedFirst,
+                                                deadline: ContinuousClock.now - .seconds(1))
+            preconditionFailure("An expired mark must not be written")
+        } catch is LibraryError {}
+        precondition(!FileManager.default.fileExists(atPath: PhotoMarkStorage.directory(markedFirst.files[0]).path))
+        store.setRejected(true, for: [markedFirst, markedSecond])
+        try await wait(store)
+        store.album = first.id
+        precondition(store.totalRejectedCount == 2 && store.rejected.count == 1)
+        store.album = second.id
+        store.labelFilter = .green
+        precondition(store.totalRejectedCount == 2 && store.rejected.isEmpty)
+        precondition(store.rejectedInAlbum(second.id).map(\.id) == [markedSecond.id])
+        store.labelFilter = nil
+        store.album = first.id
+        store.search = "不会命中"
+        precondition(store.rejectedInAlbum(first.id).map(\.id) == [markedFirst.id])
+        var attempted: [URL] = []
+        store.deletePhotos(store.rejectedInAlbum(first.id), permanently: false, recycle: { urls in
+            attempted = urls
+            return ([:], "Fixture does not recycle files")
+        })
+        try await wait(store)
+        precondition(attempted == [a] && FileManager.default.fileExists(atPath: b.path))
+        let start = ContinuousClock.now
+        let activity = StorageProgress(timeout: .seconds(10))
+        let active = try activity.begin("正在推进的文件", now: start)
+        for seconds in [6, 12, 18] {
+            try activity.advance(active, now: start + .seconds(seconds))
+        }
+        let stalled = try activity.begin("卡住的文件", now: start + .seconds(18))
+        try activity.advance(active, now: start + .seconds(24))
+        precondition(activity.stalled(now: start + .seconds(28)) == "卡住的文件")
+        activity.finish(stalled)
+        do {
+            _ = try activity.begin("后续操作", now: start + .seconds(29))
+            preconditionFailure("A stalled job must stop the batch even when other files have progress")
+        } catch is LibraryError {}
+        var finishRecycle: CheckedContinuation<([URL: URL], String?), Never>?
+        var timeoutNotice: String?
+        store.deletePhotos([markedFirst], permanently: false, recycle: { _ in
+            await withCheckedContinuation { finishRecycle = $0 }
+        }, timeout: .seconds(1), completion: { timeoutNotice = $0 })
+        for _ in 0..<200 {
+            if timeoutNotice != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        precondition(timeoutNotice?.contains("超时") == true && store.storageTimedOut && store.deletionProgress == nil)
+        precondition(store.busy && finishRecycle != nil)
+        finishRecycle?.resume(returning: ([:], nil))
+        try await wait(store)
+        precondition(!store.storageTimedOut && store.state.rejected.contains(markedFirst.id))
+        let expired = ContinuousClock.now - .seconds(1)
+        do {
+            try LibraryService.deletePermanently(markedFirst.files[0], deadline: expired)
+            preconditionFailure("An expired request must not delete a file")
+        } catch is LibraryError {}
+        precondition(FileManager.default.fileExists(atPath: a.path))
+        print("PASS album deletion remains scoped and a stalled recycle releases the progress UI")
+        store.search = ""
+        store.error = nil
+        store.setRejected(false, for: [markedFirst, markedSecond])
+        try await wait(store)
+        precondition(store.totalRejectedCount == 0)
+
         precondition(store.albums.count == 2 && store.photos.count == 2)
         precondition(store.photos.first { $0.albumID == second.id }?.files.first?.isRAW == true)
         let reopened = LibraryStore(stateURL: store.stateURL)
@@ -281,11 +411,11 @@ import AppKit
             ImportItem(source: secondImport, destination: importedRoot.appendingPathComponent("20250831_杭州/later.JPG"), bytes: 7, fallbackDate: false),
             ImportItem(source: firstImport, destination: importedRoot.appendingPathComponent("20250830_杭州/earlier.JPG"), bytes: 7, fallbackDate: false)
         ]
-        let previousReveal = store.importedAlbumReveal
+        let previousReveal = store.albumReveal
         store.executeImport(importPlan, roots: Roots(jpg: importedRoot.path))
         try await wait(store)
         precondition(store.albums.map(\.title) == ["20250830_杭州", "20250831_杭州"])
-        precondition(store.album == store.albums.first?.id && store.importedAlbumReveal != previousReveal)
+        precondition(store.album == store.albums.first?.id && store.albumReveal != previousReveal)
         precondition(store.status.contains("2 个相册") && store.status.contains("20250830_杭州、20250831_杭州"))
         print("PASS multi-album import selects and reveals the first album in sorted order")
 

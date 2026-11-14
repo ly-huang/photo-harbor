@@ -24,9 +24,9 @@ struct PhotoLabelMenu:View {
     var body:some View {
         Menu("颜色标记") {
             ForEach(PhotoLabel.allCases,id:\.self){label in
-                Button {store.toggleLabel(label,photo:photo)} label:{Label{Text((store.labels(for:photo).contains(label) ? "✓ ":"")+label.rawValue)} icon:{Image(nsImage:label.menuImage).renderingMode(.original)}.labelStyle(.titleAndIcon)}
+                Button {store.toggleLabel(label,photo:photo)} label:{Label{Text(PhotoCommand.color(label).menuTitle((store.labels(for:photo).contains(label) ? "✓ ":"")+label.rawValue))} icon:{Image(nsImage:label.menuImage).renderingMode(.original)}.labelStyle(.titleAndIcon)}
             }
-            Divider();Button("移除所有颜色标记"){store.clearLabels(photo)}.disabled(store.labels(for:photo).isEmpty)
+            Divider();Button(PhotoCommand.clearLabels.menuTitle("移除所有颜色标记")){store.clearLabels(photo)}.disabled(store.labels(for:photo).isEmpty)
         }.disabled(store.busy)
     }
 }

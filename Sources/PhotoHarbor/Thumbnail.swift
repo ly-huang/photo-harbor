@@ -2,10 +2,19 @@ import SwiftUI
 import ImageIO
 
 final class ImageCache: @unchecked Sendable {
-    static let shared = ImageCache()
+    static let shared: ImageCache = {
+        let instance = ImageCache()
+        instance.setLimit(UserDefaults.standard.object(forKey: "photo.thumbnailMiB") as? Int ?? 512)
+        return instance
+    }()
     let cache = NSCache<NSString, NSImage>()
     let queue = OperationQueue()
     init() { cache.totalCostLimit = 512 * 1024 * 1024; queue.maxConcurrentOperationCount = 3 }
+    func setLimit(_ mib: Int) {
+        // NSCache treats a zero limit as unlimited.
+        cache.totalCostLimit = max(1, mib * 1024 * 1024)
+        cache.removeAllObjects()
+    }
     private final class DecodeResult: @unchecked Sendable {
         // The operation writes this before its completion block reads it.
         var image: NSImage?
@@ -25,7 +34,9 @@ final class ImageCache: @unchecked Sendable {
                 if let cached = self.cache.object(forKey: key as NSString) { return cached }
                 guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: size] as CFDictionary) else { return nil }
                 let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-                self.cache.setObject(image, forKey: key as NSString, cost: cg.bytesPerRow * cg.height)
+                if self.cache.totalCostLimit > 1 {
+                    self.cache.setObject(image, forKey: key as NSString, cost: cg.bytesPerRow * cg.height)
+                }
                 return image
             }
         }

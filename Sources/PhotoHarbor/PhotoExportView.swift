@@ -101,7 +101,7 @@ struct PhotoFileActions: View {
     var body: some View {
         if !store.editorActive {
             ForEach(PhotoContextAction.allCases, id: \.self) { action in
-                Button(action.rawValue, role: action == .delete ? .destructive : nil) { perform(action, photos) }
+                Button(PhotoCommand(fileAction: action).menuTitle(action.rawValue), role: action == .delete ? .destructive : nil) { perform(action, photos) }
                     .disabled(store.busy || (action != .export && (!store.trusted || photos.contains(where: \.ambiguous))))
             }
         }

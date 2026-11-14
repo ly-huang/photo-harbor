@@ -30,9 +30,30 @@ import AppKit
     @Published var selected: String?
     @Published var filter = "全部照片" { didSet { visibleCache = nil } }
     @Published var album: String? { didSet { visibleCache = nil } }
-    @Published private(set) var importedAlbumReveal = UUID()
+    @Published private(set) var albumReveal = UUID()
     @Published var search = "" { didSet { visibleCache = nil } }
     @Published var busy = false
+    @Published private(set) var storageTimedOut = false
+    private var markTimeout: Duration {
+        .seconds(min(180, max(1, UserDefaults.standard.object(forKey: "photo.storageTimeout") as? Int ?? 60)))
+    }
+    private var deletionStallTimeout: Duration {
+        .seconds(min(600, max(1, UserDefaults.standard.object(forKey: "photo.deletionStallTimeout") as? Int ?? 90)))
+    }
+
+    private func watchStorage(_ progress: StorageProgress, onTimeout: @escaping (String) -> Void) -> Task<Void, Never> {
+        storageTimedOut = false
+        return Task {
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
+                if let stalled = progress.stalled() {
+                    storageTimedOut = true
+                    onTimeout(stalled)
+                    return
+                }
+            }
+        }
+    }
     @Published private(set) var marking = false
     @Published private(set) var scanningAlbums = false
     private var didStartInitialScan = false
@@ -112,15 +133,28 @@ import AppKit
     var albums: [OpenAlbum] { state.albums }
     var albumTitle: String? { albums.first { $0.id == album }?.title }
     private var rejectedCache: [Photo]?
+    private var rejectedPhotos: [Photo] {
+        if let rejectedCache { return rejectedCache }
+        let marked = photos.filter { state.rejected.contains($0.id) }
+        rejectedCache = marked
+        return marked
+    }
+
+    var totalRejectedCount: Int {
+        state.rejected.isEmpty ? 0 : rejectedPhotos.count
+    }
+
     var rejected: [Photo] {
         guard !state.rejected.isEmpty else { return [] }
-        let marked = rejectedCache ?? photos.filter { state.rejected.contains($0.id) }
-        rejectedCache = marked
-        guard album != nil || labelFilter != nil else { return marked }
-        return marked.filter { photo in
+        guard album != nil || labelFilter != nil else { return rejectedPhotos }
+        return rejectedPhotos.filter { photo in
             (album == nil || photo.albumID == album) &&
                 (labelFilter.map { labels(for: photo).contains($0) } ?? true)
         }
+    }
+    func rejectedInAlbum(_ id: String) -> [Photo] {
+        guard !state.rejected.isEmpty else { return [] }
+        return rejectedPhotos.filter { $0.albumID == id }
     }
     var undoBatches: [DeletionBatch] { state.deletionBatches.filter { (album == nil || $0.albumID == album) && !unavailable.contains($0.albumID) }.reversed() }
     private var visibleCache: (photos: [Photo], ids: [String])?
@@ -335,8 +369,13 @@ import AppKit
         busy = true
         marking = true
         status = "正在保存 \(changes.count) 张照片的标记…"
+        let timeout = markTimeout
+        let progress = StorageProgress(timeout: timeout)
+        let watchdog = watchStorage(progress) { [weak self] stalled in
+            self?.status = "保存「\(stalled)」的标记等待超时。正在等待已开始的操作返回。"
+        }
         Task {
-            defer { marking = false; busy = false }
+            defer { watchdog.cancel(); storageTimedOut = false; marking = false; busy = false }
             let results = await Task.detached {
                 await withTaskGroup(of: [(String, PhotoAnnotation, String?)].self) { group in
                     let workers = min(3, changes.count)
@@ -346,8 +385,12 @@ import AppKit
                             for index in stride(from: worker, to: changes.count, by: workers) {
                                 let (photo, annotation) = changes[index]
                                 do {
-                                    if changes.count == 1 { try await PhotoMarkStorage.savePair(annotation, for: photo) }
-                                    else { try PhotoMarkStorage.save(annotation, for: photo) }
+                                    let started = ContinuousClock.now
+                                    let job = try progress.begin(photo.name, now: started)
+                                    defer { progress.finish(job) }
+                                    let deadline = started + timeout
+                                    if changes.count == 1 { try await PhotoMarkStorage.savePair(annotation, for: photo, deadline: deadline) }
+                                    else { try PhotoMarkStorage.save(annotation, for: photo, deadline: deadline) }
                                     completed.append((photo.id, annotation, nil))
                                 } catch {
                                     completed.append((photo.id, annotation, "\(photo.name)：\(error.localizedDescription)"))
@@ -375,11 +418,45 @@ import AppKit
             if !failures.isEmpty { error = "\(failures.count) 张照片的标记保存失败。\n" + failures.prefix(3).joined(separator: "\n") }
         }
     }
-    func navigate(_ offset: Int) {
+    enum ViewerDirection: Int {
+        case previous = -1
+        case next = 1
+    }
+
+    struct ViewerAlbumTransition {
+        let originAlbumID: String
+        let originPhotoID: String
+        let album: OpenAlbum
+        let direction: ViewerDirection
+    }
+
+    enum ViewerDestination {
+        case photo(String)
+        case album(ViewerAlbumTransition)
+    }
+
+    func viewerDestination(_ direction: ViewerDirection) -> ViewerDestination? {
         let list = visible
-        guard !list.isEmpty else { return }
-        let index = list.firstIndex { $0.id == selected } ?? 0
-        selected = list[min(max(index + offset, 0), list.count - 1)].id
+        guard let selected, let index = list.firstIndex(where: { $0.id == selected }) else { return nil }
+        let next = index + direction.rawValue
+        if list.indices.contains(next) { return .photo(list[next].id) }
+        guard let album, let current = albums.firstIndex(where: { $0.id == album }) else { return nil }
+        let adjacent = direction == .next ? Array(albums.dropFirst(current + 1)) : Array(albums.prefix(current).reversed())
+        guard let destination = adjacent.first(where: { albumCounts[$0.id, default: 0] > 0 && !unavailable.contains($0.id) }) else { return nil }
+        return .album(ViewerAlbumTransition(originAlbumID: album, originPhotoID: selected,
+                                           album: destination, direction: direction))
+    }
+
+    func confirmViewerTransition(_ target: ViewerAlbumTransition) {
+        guard album == target.originAlbumID, selected == target.originPhotoID,
+              case .album(let current) = viewerDestination(target.direction),
+              current.album.id == target.album.id else { return }
+        album = current.album.id
+        filter = "全部照片"
+        search = ""
+        labelFilter = nil
+        selected = target.direction == .next ? visible.first?.id : visible.last?.id
+        albumReveal = UUID()
     }
     @discardableResult private func registerAlbum(_ roots: Roots, title: String? = nil) throws -> String {
         try roots.validate()
@@ -442,8 +519,29 @@ import AppKit
         album = ids.first
         filter = "全部照片"; search = ""; settings = false
         scan(only: Set(ids))
-        if ids.count > 1 { importedAlbumReveal = UUID() }
+        if ids.count > 1 { albumReveal = UUID() }
     }
+    @discardableResult
+    func moveAlbum(_ id: String, to targetID: String) -> Bool {
+        guard !busy, !editorActive, id != targetID,
+              let source = albums.firstIndex(where: { $0.id == id }),
+              let target = albums.firstIndex(where: { $0.id == targetID }) else { return false }
+
+        let previous = state.albums
+        var reordered = previous
+        let item = reordered.remove(at: source)
+        reordered.insert(item, at: target)
+        state.albums = reordered
+        do {
+            try persist()
+            return true
+        } catch {
+            state.albums = previous
+            self.error = "无法保存相册顺序：\(error.localizedDescription)"
+            return false
+        }
+    }
+
     func closeAlbum(_ id: String) {
         closeAlbums([id], all: false)
     }
@@ -456,6 +554,9 @@ import AppKit
         guard !busy, !editorActive, albums.contains(where: { albumIDs.contains($0.id) }) else { return }
         let photoIDs = Set(photos.filter { albumIDs.contains($0.albumID) }.map(\.id))
         let previous = state
+        let closingSelection = album.flatMap { selectedID in
+            previous.albums.firstIndex { $0.id == selectedID && albumIDs.contains($0.id) }
+        }
         if all { state.rejected.removeAll() } else { state.rejected.subtract(photoIDs) }
         state.deletionBatches.removeAll { albumIDs.contains($0.albumID) }
         state.albums.removeAll { albumIDs.contains($0.id) }
@@ -471,7 +572,12 @@ import AppKit
         comparisonSelection.removeAll { photoIDs.contains($0) }
         photos.removeAll { albumIDs.contains($0.albumID) }
         unavailable.subtract(albumIDs)
-        if let album, albumIDs.contains(album) { self.album = nil }
+        if let closingSelection {
+            album = previous.albums.dropFirst(closingSelection + 1).first { !albumIDs.contains($0.id) }?.id
+                ?? albums.first?.id
+            filter = "全部照片"
+            if album != nil { albumReveal = UUID() }
+        }
         if focused == nil { viewerController?.close() }
         if all {
             trusted = false
@@ -568,7 +674,7 @@ import AppKit
                 await reloadAlbums(only: registrationFailed ? nil : seenAlbumIDs)
             }
             status = outcome; busy = false
-            if !openedAlbumIDs.isEmpty { importedAlbumReveal = UUID() }
+            if !openedAlbumIDs.isEmpty { albumReveal = UUID() }
         }
     }
     func deleteRejected(permanently: Bool = false, recycle: (([URL]) async -> ([URL: URL], String?))? = nil) {
@@ -577,7 +683,7 @@ import AppKit
 
     func deletePhotos(_ targets: [Photo], permanently: Bool,
                       recycle: (([URL]) async -> ([URL: URL], String?))? = nil,
-                      completion: ((String?) -> Void)? = nil) {
+                      timeout: Duration? = nil, completion: ((String?) -> Void)? = nil) {
         guard trusted, !busy, !editorActive, !targets.isEmpty else {
             completion?("当前无法删除照片，请稍后重试。")
             return
@@ -585,12 +691,20 @@ import AppKit
         let action = permanently ? "直接删除" : "移入废纸篓"
         busy = true
         status = "正在核对照片及配对关系…"
+        let progress = StorageProgress(timeout: timeout ?? deletionStallTimeout)
+        let watchdog = watchStorage(progress) { [weak self] stalled in
+            let message = "「\(stalled)」长时间无进展，等待超时。正在等待已开始的操作返回，结果会自动更新。"
+            self?.status = message
+            self?.deletionProgress = nil
+            completion?(message)
+        }
         Task {
             deletionProgress = DeletionProgress(title: action, total: targets.count, inLibrary: completion == nil, stage: status)
-            defer { deletionProgress = nil; busy = false }
+            defer { watchdog.cancel(); storageTimedOut = false; deletionProgress = nil; busy = false }
             var count = 0
             var changedAlbums: Set<String> = []
             var failures: [String] = []
+            var recycledFiles: [PhotoFile] = []
             do {
                 let files = targets.flatMap { photo in photo.files.map { (photo.albumID, $0) } }
                 guard Set(files.map { $0.1.url }).count == files.count else {
@@ -600,21 +714,23 @@ import AppKit
                     guard let owner = state.albums.first(where: { $0.id == id }) else {
                         throw LibraryError.message("相册已关闭。")
                     }
-                    return (photos, owner.roots)
+                    return (photos, owner)
                 }
                 try await withThrowingTaskGroup(of: Void.self) { group in
                     var pending = groups.makeIterator()
                     for _ in 0..<min(3, groups.count) {
-                        if let (photos, roots) = pending.next() {
-                            group.addTask { try LibraryService.validateDeletion(photos, roots: roots) }
+                        if let (photos, owner) = pending.next() {
+                            group.addTask { try Self.validateDeletion(photos, in: owner, progress: progress) }
                         }
                     }
                     while try await group.next() != nil {
-                        if let (photos, roots) = pending.next() {
-                            group.addTask { try LibraryService.validateDeletion(photos, roots: roots) }
+                        try progress.check()
+                        if let (photos, owner) = pending.next() {
+                            group.addTask { try Self.validateDeletion(photos, in: owner, progress: progress) }
                         }
                     }
                 }
+                try progress.check()
                 if permanently {
                     status = "正在直接删除照片…"
                     deletionProgress?.stage = status
@@ -623,30 +739,40 @@ import AppKit
                         var pending = targets.makeIterator()
                         for _ in 0..<min(4, targets.count) {
                             if let photo = pending.next() {
-                                group.addTask { Self.removePhotoFiles(photo) }
+                                group.addTask { Self.removePhotoFiles(photo, progress: progress) }
                             }
                         }
                         for await (albumID, removed, problem) in group {
-                            if let photo = pending.next() {
-                                group.addTask { Self.removePhotoFiles(photo) }
+                            if progress.stalled() == nil, let photo = pending.next() {
+                                group.addTask { Self.removePhotoFiles(photo, progress: progress) }
                             }
                             count += removed
                             if removed > 0 { changedAlbums.insert(albumID) }
                             if let problem { failures.append(problem) }
                             deletionProgress?.completed? += 1
                         }
+                        let unscheduled = Array(IteratorSequence(pending)).count
+                        if unscheduled > 0 { failures.append("等待超时，\(unscheduled) 张照片尚未开始删除。") }
                     }
                 } else {
                     try persist()
                     try await Task.detached {
-                        for (_, file) in files { try LibraryService.validateRemoval(file) }
+                        let job = try progress.begin("准备废纸篓操作")
+                        defer { progress.finish(job) }
+                        for (_, file) in files {
+                            try progress.advance(job, label: "核对 \(file.url.lastPathComponent)")
+                            try LibraryService.validateRemoval(file)
+                        }
                     }.value
+                    let job = try progress.begin("macOS 废纸篓")
                     status = "正在等待系统移入废纸篓…"
                     deletionProgress?.stage = status
                     let urls = files.map { $0.1.url }
                     let (locations, problem): ([URL: URL], String?)
                     if let recycle { (locations, problem) = await recycle(urls) }
                     else { (locations, problem) = await Self.recycleFiles(urls) }
+                    progress.finish(job)
+                    watchdog.cancel()
                     var batches: [String: DeletionBatch] = [:]
                     var moved: [PhotoFile] = []
                     for (albumID, file) in files {
@@ -662,13 +788,7 @@ import AppKit
                         state.deletionBatches.append(contentsOf: batches.values.sorted { $0.albumID < $1.albumID })
                         do { try persist() }
                         catch { failures.append("无法保存废纸篓撤销记录。\(error.localizedDescription)") }
-                        let markFailures = await Task.detached { [moved] in
-                            moved.compactMap { file -> String? in
-                                do { try PhotoMarkStorage.consumeRejection(file); return nil }
-                                catch { return "无法清除「\(file.url.lastPathComponent)」的待删除标记。\(error.localizedDescription)" }
-                            }
-                        }.value
-                        failures.append(contentsOf: markFailures)
+                        recycledFiles = moved
                     }
                     if count != files.count {
                         failures.append("\(files.count - count) 个文件未确认移入废纸篓。NAS 共享需要支持 macOS 废纸篓并允许移动。")
@@ -676,21 +796,35 @@ import AppKit
                     if let problem { failures.append(problem) }
                 }
             } catch { failures.append(error.localizedDescription) }
+            watchdog.cancel()
+            deletionProgress = nil
+            let result: String
+            if !failures.isEmpty {
+                result = count == 0 ? "未能\(action)。" : "\(action)完成，已处理 \(count) 个文件，有错误。"
+                let message = ([result] + Array(failures.prefix(5)) + (failures.count > 5 ? ["另有 \(failures.count - 5) 条错误。"] : [])).joined(separator: "\n")
+                if let completion, !storageTimedOut { completion(message) } else { self.error = message }
+            } else {
+                result = permanently ? "已直接删除 \(count) 个文件。" : "已将 \(count) 个文件移入废纸篓，按相册和操作批次记录。"
+                if !storageTimedOut { completion?(nil) }
+            }
             if !changedAlbums.isEmpty {
-                status = "正在更新受影响的相册…"
-                deletionProgress?.stage = status
-                deletionProgress?.completed = nil
+                status = result + " 正在更新受影响的相册…"
+                if !recycledFiles.isEmpty {
+                    let markFailures = await Task.detached { [recycledFiles] in
+                        recycledFiles.compactMap { file -> String? in
+                            do { try PhotoMarkStorage.consumeRejection(file); return nil }
+                            catch { return "无法清除「\(file.url.lastPathComponent)」的待删除标记。\(error.localizedDescription)" }
+                        }
+                    }.value
+                    if !markFailures.isEmpty {
+                        let message = "\(markFailures.count) 个已移入废纸篓的文件未能清除待删除标记。\n" +
+                            markFailures.prefix(3).joined(separator: "\n")
+                        self.error = [self.error, message].compactMap { $0 }.joined(separator: "\n")
+                    }
+                }
                 await reloadAlbums(only: changedAlbums)
             }
-            deletionProgress = nil
-            if !failures.isEmpty {
-                status = count == 0 ? "未能\(action)。" : "\(action)完成，已处理 \(count) 个文件，有错误。"
-                let message = ([status] + Array(failures.prefix(5)) + (failures.count > 5 ? ["另有 \(failures.count - 5) 条错误。"] : [])).joined(separator: "\n")
-                if let completion { completion(message) } else { self.error = message }
-            } else {
-                status = permanently ? "已直接删除 \(count) 个文件。" : "已将 \(count) 个文件移入废纸篓，按相册和操作批次记录。"
-                completion?(nil)
-            }
+            status = result
         }
     }
 
@@ -702,17 +836,37 @@ import AppKit
         }
     }
 
-    nonisolated private static func removePhotoFiles(_ photo: Photo) -> (String, Int, String?) {
+    nonisolated private static func validateDeletion(_ photos: [Photo], in album: OpenAlbum, progress: StorageProgress) throws {
+        let job = try progress.begin("核对相册 \(album.title)")
+        defer { progress.finish(job) }
+        try LibraryService.validateDeletion(photos, roots: album.roots) {
+            try Task.checkCancellation()
+            try progress.advance(job)
+        }
+    }
+
+    nonisolated private static func removePhotoFiles(_ photo: Photo, progress: StorageProgress) -> (String, Int, String?) {
+        let job: UUID
+        do { job = try progress.begin("删除 \(photo.name)") }
+        catch { return (photo.albumID, 0, error.localizedDescription) }
+        defer { progress.finish(job) }
         var removed = 0
         var markFailures: [String] = []
         for file in photo.files {
             do {
-                try LibraryService.deletePermanently(file)
+                try progress.advance(job, label: "核对 \(file.url.lastPathComponent)")
+                try LibraryService.deletePermanently(file) {
+                    try progress.advance(job, label: "删除 \(file.url.lastPathComponent)")
+                }
                 removed += 1
             } catch {
                 return (photo.albumID, removed, "无法直接删除「\(file.url.lastPathComponent)」。\(error.localizedDescription)")
             }
-            do { try PhotoMarkStorage.consumeRejection(file) }
+            do {
+                // Always preserve cleanup for an unlink that already succeeded.
+                try? progress.advance(job, label: "更新 \(file.url.lastPathComponent) 的标记")
+                try PhotoMarkStorage.consumeRejection(file)
+            }
             catch { markFailures.append("文件已删除，但无法更新「\(file.url.lastPathComponent)」的标记。\(error.localizedDescription)") }
         }
         return (photo.albumID, removed, markFailures.isEmpty ? nil : markFailures.joined(separator: "\n"))
