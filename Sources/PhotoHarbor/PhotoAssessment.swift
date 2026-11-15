@@ -34,6 +34,7 @@ actor AssessmentService {
     private struct Entry { let stats: PhotoAssessment; let feature: Any? }
     private var cache: [String: Entry] = [:]
     private func analyze(_ url: URL) async throws -> Entry {
+        try Task.checkCancellation()
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         let stamp = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         let key = "\(url.path)|\(stamp)|\(attributes[.size] ?? "")"
@@ -43,10 +44,12 @@ actor AssessmentService {
         var stats = pixelMetrics(image)
         stats.metadata = Metadata.read(url)
         var feature: Any?
+        try Task.checkCancellation()
         if #available(macOS 15.0, *) {
             var request = GenerateImageFeaturePrintRequest(.revision2)
             request.cropAndScaleAction = .scaleToFit
             feature = try? await request.perform(on: image)
+            try Task.checkCancellation()
             if let observation = try? await CalculateImageAestheticsScoresRequest(.revision1).perform(on: image) {
                 stats.aesthetics = Double(observation.overallScore + 1) * 50
                 stats.aestheticsNote = observation.isUtility ? "系统判为记录用途；评分仅供参考" : "Apple Vision 模型参考分"
@@ -60,6 +63,7 @@ actor AssessmentService {
             }
             stats.aestheticsNote = "审美评分需要 macOS 15 或更新版本"
         }
+        try Task.checkCancellation()
         let entry = Entry(stats: stats, feature: feature)
         if cache.count >= 100 { cache.removeAll() }
         cache[key] = entry

@@ -109,16 +109,25 @@ import AppKit
         if let window = comparisonController?.window { activateWindow(window) }
     }
     func recordAssessment(_ result: PhotoAssessment, for photo: Photo) {
-        guard photos.contains(where: { $0.id == photo.id }) else { return }
+        guard photosByID[photo.id] != nil else { return }
         assessments[photo.id] = result; assessmentErrors[photo.id] = nil
     }
     func assessPhoto(_ photo: Photo) {
+        Task { await runAssessment(photo) }
+    }
+    func assessInViewer(_ photo: Photo) async {
+        guard viewer, !editorActive, selected == photo.id,
+              assessments[photo.id] == nil, assessmentErrors[photo.id] == nil else { return }
+        await runAssessment(photo)
+    }
+    private func runAssessment(_ photo: Photo) async {
+        guard !Task.isCancelled, photosByID[photo.id] != nil else { return }
         guard !assessing.contains(photo.id) else { return }
         assessing.insert(photo.id); assessmentErrors[photo.id] = nil
-        Task {
-            defer { assessing.remove(photo.id) }
-            do { recordAssessment(try await AssessmentService.shared.assess(photo.preview), for: photo) }
-            catch { assessmentErrors[photo.id] = error.localizedDescription }
+        defer { assessing.remove(photo.id) }
+        do { recordAssessment(try await AssessmentService.shared.assess(photo.preview), for: photo) }
+        catch {
+            if !Task.isCancelled, photosByID[photo.id] != nil { assessmentErrors[photo.id] = error.localizedDescription }
         }
     }
     private func activateWindow(_ window: NSWindow) {
@@ -288,9 +297,11 @@ import AppKit
         return result
     }
 
-    func reloadAfterEditing(_ url: URL) async {
-        guard let oldPhoto = photos.first(where: { $0.files.contains { $0.url == url } }) else { return }
+    @discardableResult func reloadAfterEditing(_ url: URL) async -> Photo? {
+        guard let oldPhoto = photos.first(where: { $0.files.contains { $0.url == url } }) else { return nil }
+        let wasBusy = busy
         busy = true
+        defer { busy = wasBusy }
         let oldColors = annotations[oldPhoto.id]?.colors ?? []
         await reloadAlbums(only: [oldPhoto.albumID])
         if let edited = photos.first(where: { $0.files.contains(where: { $0.url == url }) }) {
@@ -300,8 +311,9 @@ import AppKit
                 do{try await Task.detached{try PhotoMarkStorage.save(annotation,for:edited)}.value;annotations[edited.id]=annotation;state.rejected.remove(edited.id);save()}
                 catch{self.error="照片已保存，颜色标记未能更新到新版本：\(error.localizedDescription)"}
             }
+            return edited
         }
-        busy = false
+        return nil
     }
     func select(_ photo: Photo) { if selected != photo.id { selected = photo.id } }
     func reconcileSelection() {

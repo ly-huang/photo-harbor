@@ -40,7 +40,7 @@ import UniformTypeIdentifiers
         let afterMetadataChange = try EditPersistence.snapshot(jpg)
         precondition(beforeMetadataChange != afterMetadataChange)
         precondition(beforeMetadataChange.digest == afterMetadataChange.digest)
-        _ = try EditPersistence.save(blue, to: jpg, expected: beforeMetadataChange, renderedFrom: afterMetadataChange)
+        _ = try EditPersistence.save(blue, to: jpg, expected: beforeMetadataChange, verifiedCurrent: afterMetadataChange)
         try require(try Data(contentsOf: jpg) == blue)
         _ = try EditPersistence.save(original, to: jpg, expected: EditPersistence.snapshot(jpg))
         _ = try EditPersistence.save(blue, to: jpg, expected: EditPersistence.snapshot(jpg))
@@ -123,9 +123,41 @@ import UniformTypeIdentifiers
         let saved = CGImageSourceCreateWithURL(renderURL as CFURL, nil)!
         let savedImage = CGImageSourceCreateImageAtIndex(saved, 0, nil)!
         precondition(savedImage.width == 48 && savedImage.height == 48)
+        adjustments.crop = "原比例"
+        adjustments.exposure = -0.25
+        try await engine.save(adjustments, lut: nil, directory: library)
+        let resaved = CGImageSourceCreateWithURL(renderURL as CFURL, nil)!
+        let resavedImage = CGImageSourceCreateImageAtIndex(resaved, 0, nil)!
+        precondition(resavedImage.width == 48 && resavedImage.height == 64)
+        try require(try Data(contentsOf: EditPersistence.backupURL(renderURL)) == renderOriginal)
         try await engine.restore()
         try require(try Data(contentsOf: renderURL) == renderOriginal)
         precondition(Metadata.read(renderURL).camera == "EditorFixture")
+        let sessionURL = root.appendingPathComponent("session.JPG")
+        try jpeg(sessionURL, color: .blue)
+        let sessionOriginal = try Data(contentsOf: sessionURL)
+        let session = PhotoEditorModel(directory: root)
+        await session.open(sessionURL)
+        session.change { $0.exposure = -0.5 }
+        let firstSave = await session.save {
+            precondition(session.working && !session.dirty && session.hasBackup)
+        }
+        precondition(firstSave && session.savedAdjustments?.exposure == -0.5 && session.undo.count == 1)
+        session.undoChange()
+        precondition(session.dirty && session.adjustments == PhotoAdjustments())
+        session.redoChange()
+        precondition(!session.dirty)
+        session.change { $0.exposure = 0.25 }
+        let secondSave = await session.save()
+        precondition(secondSave && !session.dirty && session.undo.count == 2)
+        session.change { $0.exposure = 0.5 }
+        try jpeg(sessionURL, color: .red)
+        let external = try Data(contentsOf: sessionURL)
+        let conflictingSave = await session.save()
+        precondition(!conflictingSave && session.dirty && session.savedAdjustments?.exposure == 0.25)
+        try require(try Data(contentsOf: sessionURL) == external)
+        try require(try Data(contentsOf: EditPersistence.backupURL(sessionURL)) == sessionOriginal)
+        print("PASS repeated saves use the session source, preserve undo and reject external changes")
         let orientedURL = root.appendingPathComponent("oriented.JPG")
         try jpeg(orientedURL, color: .blue, orientation: 6)
         let orientedEngine = PhotoEditEngine(softwareRendering: true)

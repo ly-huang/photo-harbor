@@ -32,8 +32,8 @@ DMG 仅包含应用、Applications 快捷入口、MIT 许可证及安装说明�
 
 ## 维护者发布步骤
 
-1. 更新 `scripts/build-app.sh` 中的版本号与 build number。
-2. 在 CHANGELOG 添加同版本章节，并同步受影响文档。
+1. 确认同一发布线的上一个公开 Release 标签。用 `git log <上一个标签>..<本次发布目标>` 检查区间内的提交，并用 `git diff <上一个标签> <本次发布目标>` 核对最终差异。若改动尚未提交，可先用 `git diff <上一个标签>` 核对工作区，并另行检查本次要纳入的新文件。
+2. 更新 `scripts/build-app.sh` 中的版本号与 build number。在 CHANGELOG 对应版本章节中归纳整个区间的用户可见变化，合并同一功能的迭代记录，并同步受影响文档。该章节会直接用于 GitHub Release。
 3. 完成检查、release 构建及必要实机验证后提交并推送。
 4. 在目标提交上创建版本标签，例如：
 

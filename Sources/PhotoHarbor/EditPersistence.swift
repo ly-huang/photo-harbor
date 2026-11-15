@@ -112,7 +112,7 @@ enum EditPersistence {
               CGImageSourceGetType(source) as String? == "public.jpeg",
               CGImageSourceCreateImageAtIndex(source, 0, nil) != nil else { throw LibraryError.message("生成的 JPG 无法解码，原图未修改。") }
     }
-    @discardableResult static func save(_ data: Data, to url: URL, expected: EditSnapshot, renderedFrom source: EditSnapshot? = nil) throws -> EditSnapshot {
+    @discardableResult static func save(_ data: Data, to url: URL, expected: EditSnapshot, verifiedCurrent source: EditSnapshot? = nil) throws -> EditSnapshot {
         try validateJPEG(data)
         let current = try source ?? snapshot(url)
         guard current.matchesFile(expected), try stillMatches(url, observed: current) else {

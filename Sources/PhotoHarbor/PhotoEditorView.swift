@@ -5,7 +5,9 @@ import UniformTypeIdentifiers
 struct PhotoEditorView: View {
     @EnvironmentObject var store: LibraryStore
     @StateObject private var model: PhotoEditorModel
-    let photo: Photo
+    private let openedPhoto: Photo
+    @ViewState private var refreshedPhoto: Photo?
+    private var photo: Photo { refreshedPhoto ?? openedPhoto }
     let close: (Bool) -> Void
     @ViewState private var fitToken = 0
     @ViewState private var before = false
@@ -17,7 +19,7 @@ struct PhotoEditorView: View {
     @ViewState private var comparisonHelp = false
     @ViewState private var tab = EditorTab.adjust
     init(photo: Photo, directory: URL, close: @escaping (Bool) -> Void) {
-        self.photo = photo; self.close = close
+        self.openedPhoto = photo; self.close = close
         _model = StateObject(wrappedValue: PhotoEditorModel(directory: directory))
     }
     var body: some View {
@@ -33,6 +35,7 @@ struct PhotoEditorView: View {
                         cropActive: model.cropEditing, cropAspect: model.cropAspect, cropSelection: model.adjustments.cropRect,
                         cropChanged: { rect in model.change { $0.cropRect = rect } }, exit: { requestClose(false) },
                         toggleNavigator: { store.navigatorVisible.toggle() },labels:store.labels(for:photo),labelChanged:{if let label=$0{store.toggleLabel(label,photo:photo)}else{store.clearLabels(photo)}},contextMarkAction:{store.toggleReject(photo)},rejected:store.state.rejected.contains(photo.id), navigatorTopInset: 60, previous: {}, next: {}, mark: {})
+                        .allowsHitTesting(!model.working)
                 } else { ProgressView("正在读取 JPG…") }
                 VStack {
                     ViewThatFits(in: .horizontal) {
@@ -65,7 +68,7 @@ struct PhotoEditorView: View {
         .overlay(alignment: .top) { WindowHeaderMaterial().frame(height: store.viewerFullScreen ? 0 : 28).allowsHitTesting(false) }
         .ignoresSafeArea(.container, edges: .top)
         .background(ChromeTracking(state: chrome).frame(width: 0, height: 0))
-        .task { await model.open(photo.preview) }
+        .task { await model.open(openedPhoto.preview) }
         .onChange(of: model.adjustments) { _, _ in before = false; model.schedulePreview() }
         .onChange(of:tab) { _, selected in
             controlsVisible=true;model.activeBrush=nil
@@ -91,7 +94,7 @@ struct PhotoEditorView: View {
             Button("继续编辑", role: .cancel) {}
         } message: { Text("原始 JPG 和 ARW 都不会变化。") }
         .confirmationDialog("用最初备份还原 JPG？", isPresented: $confirmRestore, titleVisibility: .visible) {
-            Button("还原最初 JPG", role: .destructive) { Task { if await model.restore() { await saved() } } }
+            Button("还原最初 JPG", role: .destructive) { Task { await restoreOriginal() } }
             Button("取消", role: .cancel) {}
         } message: { Text("当前 JPG 会被最初的备份替换，未保存调整会丢弃，ARW 保持原样。") }
     }
@@ -99,13 +102,14 @@ struct PhotoEditorView: View {
         FloatingTools {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing:5){Text(photo.name).font(.system(size: 13, weight: .semibold)).lineLimit(1);if !store.labels(for:photo).isEmpty{PhotoLabelDots(labels:store.labels(for:photo))}}
-                Text(model.rotationEditing ? "旋转中" : (model.cropEditing ? "裁剪中" : (before ? "编辑前" : (model.dirty ? "编辑中 · 未保存" : "编辑 JPG")))).font(.caption2).lineLimit(1)
+                Text(editorStatus).font(.caption2).lineLimit(1)
             }.frame(maxWidth: compact ? 85 : 160, alignment: .leading)
             Divider().frame(height: 22)
             Button { requestClose(false) } label: { Label("返回看图", systemImage: "chevron.left") }.disabled(model.working).help("返回看图")
             if model.rendering || model.working { ProgressView().controlSize(.small) }
-            Button { Task { if await model.save() { await saved() } } } label: { Label("保存", systemImage: "square.and.arrow.down") }
-                .disabled(model.loading || model.working || !model.dirty || model.preview == nil ).help("保存并覆盖 JPG，首次保留原始备份")
+            Button { Task { await saveEdits() } } label: { Label("保存", systemImage: "square.and.arrow.down") }
+                .disabled(store.busy || model.loading || model.working || !model.dirty || model.preview == nil)
+                .help("保存并覆盖 JPG，留在编辑页面")
             Divider().frame(height: 22)
             Button { controlsVisible.toggle() } label: { Label(controlsVisible ? "隐藏编辑面板" : "显示编辑面板", systemImage: controlsVisible ? "sidebar.right" : "sidebar.right") }.labelStyle(.iconOnly).help(controlsVisible ? "隐藏编辑面板" : "显示编辑面板")
             NavigatorToggle(visible: $store.navigatorVisible)
@@ -118,7 +122,37 @@ struct PhotoEditorView: View {
         closeWindow = entireWindow
         if model.dirty { confirmDiscard = true } else { close(entireWindow) }
     }
-    private func saved() async { await store.reloadAfterEditing(photo.preview); close(false) }
+    private var editorStatus: String {
+        if model.working { return "正在处理…" }
+        if before { return "编辑前" }
+        if model.dirty { return "编辑中 · 未保存" }
+        if model.savedAdjustments != nil { return "已保存" }
+        if model.rotationEditing { return "旋转中" }
+        if model.cropEditing { return "裁剪中" }
+        return "编辑 JPG"
+    }
+
+    private func saveEdits() async {
+        guard !store.busy, !model.working else { return }
+        store.busy = true
+        defer { store.busy = false }
+        before = false
+        _ = await model.save {
+            if let updated = await store.reloadAfterEditing(openedPhoto.preview) {
+                refreshedPhoto = updated
+            }
+        }
+    }
+
+    private func restoreOriginal() async {
+        guard !store.busy, !model.working else { return }
+        store.busy = true
+        defer { store.busy = false }
+        if await model.restore() {
+            await store.reloadAfterEditing(openedPhoto.preview)
+            close(false)
+        }
+    }
 
 }
 

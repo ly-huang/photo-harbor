@@ -974,6 +974,7 @@ struct ImportView: View {
 }
 
 struct ViewerView: View {
+    @AppStorage("photo.viewerAutoAssessment") private var autoAssessment = true
     @ViewState private var photoAction: PhotoContextRequest?
     @EnvironmentObject var store: LibraryStore
     @StateObject private var albumTransition = AlbumTransitionState()
@@ -981,6 +982,10 @@ struct ViewerView: View {
     @ViewState private var fitToken = 0
     @StateObject private var info = InspectorState()
     @ViewState private var editingPhoto: Photo?
+    private var automaticAssessmentID: String? {
+        guard autoAssessment, store.viewer, editingPhoto == nil else { return nil }
+        return store.focused?.id
+    }
     private var preloadWindow: [URL] {
         guard let current = store.focused?.preview else { return [] }
         return ViewerImageCache.neighbors(store.visible.map(\.preview), current: current)
@@ -1059,6 +1064,11 @@ struct ViewerView: View {
             }
         }
         .onDisappear { Task { await ViewerImageCache.shared.clear() } }
+        .task(id: automaticAssessmentID) {
+            guard let id = automaticAssessmentID, let photo = store.focused, photo.id == id else { return }
+            do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
+            await store.assessInViewer(photo)
+        }
         .sheet(item: $photoAction) { PhotoContextSheet(request: $0).environmentObject(store) }
         .alert("切换相册？", isPresented: Binding(
             get: { albumTransition.target != nil },

@@ -3,6 +3,7 @@
 - 这是原生 macOS SwiftUI / AppKit 项目，先读 README 和 docs/ARCHITECTURE.md。
 - 构建：`zsh scripts/build-app.sh`；检查：`zsh scripts/check.sh`。脚本是独立于个人配置的标准入口。
 - 任何功能、修复、构建、状态模型或测试行为变更都必须更新 CHANGELOG.md，并同步对应 README / docs。PR CI 会检查代码变更是否附带 CHANGELOG。
+- 编写 GitHub Release 更新说明前，确认同一发布线的上一个公开版本标签，并与本次发布目标比较。汇总两版之间所有面向用户的功能、修复和行为变化，合并重复或过渡性条目，写入 CHANGELOG.md 对应版本章节。说明必须覆盖整个版本区间，不能只根据最近一次本地修改或提交撰写。
 - 不读取个人照片作为测试夹具。UI 验证使用 `make-fixtures.swift` 和 `PHOTOHARBOR_STATE_PATH`。禁止提交照片、状态、日志、个人绝对路径、密钥和访问令牌。
 - 提交前运行 `ruby scripts/check-repository.rb` 并人工审阅 Git 暂存区。检查结果只显示规则和路径，不打印疑似密钥。
 - `.build/`、`dist.noindex/`、`archive.local/` 是本地产物，不作为源码依赖，不提交。

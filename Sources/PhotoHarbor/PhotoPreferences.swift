@@ -135,6 +135,7 @@ extension View {
 }
 
 struct PhotoPreferences: View {
+    @AppStorage("photo.viewerAutoAssessment") private var autoAssessment = true
     @AppStorage("photo.thumbnailMiB") private var thumbnails = 512
     @AppStorage("photo.viewerMiB") private var viewer = 1024
     @AppStorage("photo.storageTimeout") private var markTimeout = 60
@@ -148,6 +149,12 @@ struct PhotoPreferences: View {
 
     var body: some View {
         TabView {
+            Form {
+                Toggle("大图自动评测", isOn: $autoAssessment)
+                Text("停留在大图时，在本机评测该照片。关闭后仍可手动评测。")
+                    .foregroundStyle(.secondary)
+            }.formStyle(.grouped)
+                .tabItem { Label("浏览", systemImage: "photo") }
             Form {
                 Picker("缩略图缓存（MiB）", selection: $thumbnails) {
                     ForEach([0, 128, 256, 512, 1024, 2048], id: \.self) { Text("\($0)").tag($0) }

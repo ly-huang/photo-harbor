@@ -77,6 +77,7 @@ actor PhotoEditEngine {
     }
     private var sourceURL: URL?
     private var expected: EditSnapshot?
+    private var sessionSource: Data?
     private var previewInput: CIImage?
     private var faces: [CGRect] = []
     private var referenceKey: PhotoAdjustments?
@@ -94,7 +95,7 @@ actor PhotoEditEngine {
         try Task.checkCancellation()
         guard try EditPersistence.stillMatches(url, observed: snapshot) else { throw LibraryError.message("照片读取期间已变化。") }
         faces = detectedFaces
-        sourceURL = url; expected = snapshot; previewInput = input; referenceKey = nil; referenceCache = nil; thumbnailsKey = nil; thumbnailsCache = [:]; importedThumbnailKey=nil; importedThumbnailCache.removeAll();stripCache.removeAll()
+        sourceURL = url; expected = snapshot; sessionSource = bytes; previewInput = input; referenceKey = nil; referenceCache = nil; thumbnailsKey = nil; thumbnailsCache = [:]; importedThumbnailKey=nil; importedThumbnailCache.removeAll();stripCache.removeAll()
         let backup = try EditPersistence.record(url, current: snapshot) != nil
         return EditorInput(image: image, snapshot: snapshot, hasBackup: backup, faces: faces.count)
     }
@@ -127,10 +128,14 @@ actor PhotoEditEngine {
         return image
     }
     func save(_ adjustments: PhotoAdjustments, lut: LUTEntry?, directory: URL, preset: ImportedPhotoFilter? = nil) throws {
-        guard let url = sourceURL, let expected else { throw LibraryError.message("照片尚未加载。") }
-        let (sourceBytes, sourceSnapshot) = try EditPersistence.readSource(url)
+        guard let url = sourceURL, let expected, let sessionSource else { throw LibraryError.message("照片尚未加载。") }
+        let sourceSnapshot = try EditPersistence.snapshot(url)
         guard sourceSnapshot.matchesFile(expected) else { throw LibraryError.message("照片已在其他程序修改，请重新打开编辑。") }
-        guard let source = CGImageSourceCreateWithData(sourceBytes as CFData, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw LibraryError.message("无法读取完整 JPG。") }
+        if adjustments == PhotoAdjustments(), lut == nil, preset == nil {
+            self.expected = try EditPersistence.save(sessionSource, to: url, expected: expected, verifiedCurrent: sourceSnapshot)
+            return
+        }
+        guard let source = CGImageSourceCreateWithData(sessionSource as CFData, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw LibraryError.message("无法读取完整 JPG。") }
         var properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] ?? [:]
         let orientation = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
         let input = CIImage(cgImage: image).oriented(forExifOrientation: orientation)
@@ -151,7 +156,7 @@ actor PhotoEditEngine {
         guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { throw LibraryError.message("无法创建 JPG 输出。") }
         CGImageDestinationAddImage(destination, rendered, properties as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw LibraryError.message("无法编码 JPG。") }
-        self.expected = try EditPersistence.save(data as Data, to: url, expected: expected, renderedFrom: sourceSnapshot)
+        self.expected = try EditPersistence.save(data as Data, to: url, expected: expected, verifiedCurrent: sourceSnapshot)
     }
     func restore() throws {
         guard let url = sourceURL, let expected else { throw LibraryError.message("照片尚未加载。") }
@@ -353,7 +358,8 @@ actor PhotoEditEngine {
     private var renderTask: Task<Void, Never>?
     private var gestureStart: PhotoAdjustments?
     private var generation = 0
-    var dirty: Bool { adjustments != PhotoAdjustments() }
+    @Published private(set) var savedAdjustments: PhotoAdjustments?
+    var dirty: Bool { adjustments != (savedAdjustments ?? PhotoAdjustments()) }
     init(directory: URL) { library = LUTLibrary.shared(directory: directory.appendingPathComponent("LUTs", isDirectory: true)) }
     func open(_ url: URL) async {
         do {
@@ -381,8 +387,8 @@ actor PhotoEditEngine {
     }
     func endGesture() { if let before = gestureStart, before != adjustments { undo.append(before); redo.removeAll() }; gestureStart = nil }
     func change(_ update: (inout PhotoAdjustments) -> Void) { let before = adjustments; update(&adjustments); if before != adjustments { if gestureStart == nil {undo.append(before)}; redo.removeAll() } }
-    func undoChange() { guard let prior = undo.popLast() else { return }; redo.append(adjustments); adjustments = prior }
-    func redoChange() { guard let next = redo.popLast() else { return }; undo.append(adjustments); adjustments = next }
+    func undoChange() { guard !working, let prior = undo.popLast() else { return }; redo.append(adjustments); adjustments = prior }
+    func redoChange() { guard !working, let next = redo.popLast() else { return }; undo.append(adjustments); adjustments = next }
     func schedulePreview() {
         generation += 1
         guard renderTask == nil else { return }
@@ -562,14 +568,19 @@ actor PhotoEditEngine {
             cropInfo = detected ? "按显著主体推荐，仍可拖动微调；切回调整或滤镜可预览裁剪结果。" : "未识别明显主体，使用保守构图；可拖动微调。"
         } catch { self.error = error.localizedDescription }
     }
-    func save() async -> Bool {
+    func save(onSaved: () async -> Void = {}) async -> Bool {
+        guard !working, dirty else { return false }
         working = true; defer { working = false }
+        let saving = adjustments
         do {
-            let entry = library.entries.first { $0.id == adjustments.lutID }
-            guard adjustments.lutID.isEmpty || entry != nil else { throw LibraryError.message("所选 LUT 已不在库中。") }
-            let preset=library.photoFilters.first { $0.id==adjustments.presetID }
-            guard adjustments.presetID.isEmpty || preset != nil else { throw LibraryError.message("所选 XMP 滤镜已从库中移除。") }
-            try await engine.save(adjustments, lut: entry, directory: library.directory,preset:preset)
+            let entry = library.entries.first { $0.id == saving.lutID }
+            guard saving.lutID.isEmpty || entry != nil else { throw LibraryError.message("所选 LUT 已不在库中。") }
+            let preset = library.photoFilters.first { $0.id == saving.presetID }
+            guard saving.presetID.isEmpty || preset != nil else { throw LibraryError.message("所选 XMP 滤镜已从库中移除。") }
+            try await engine.save(saving, lut: entry, directory: library.directory, preset: preset)
+            savedAdjustments = saving
+            hasBackup = true
+            await onSaved()
             return true
         } catch { self.error = error.localizedDescription; return false }
     }

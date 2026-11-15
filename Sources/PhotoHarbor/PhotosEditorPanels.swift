@@ -21,7 +21,7 @@ struct EditorSidebar:View {
                 }.padding(.trailing,14).padding(.bottom,8)
             }.scrollIndicators(.visible)
             Divider()
-            HStack { Button("还原最初 JPG",action:restore).disabled(!model.hasBackup);Spacer();if tab != .crop { Button("还原调整") { model.change { $0=PhotoAdjustments() } }.disabled(!model.dirty) } }.font(.caption)
+            HStack { Button("还原最初 JPG",action:restore).disabled(!model.hasBackup);Spacer();if tab != .crop { Button("还原调整") { model.change { $0=PhotoAdjustments() } }.disabled(model.adjustments == PhotoAdjustments()) } }.font(.caption)
             Text("保存覆盖 JPG；最初备份保留，RAW 不变。").font(.caption2).foregroundStyle(.secondary)
         }.padding(18).modifier(ArrowPointer())
     }
